@@ -1,0 +1,263 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+"""Typed, content-addressed building blocks for engineering workflows.
+
+This root module re-exports the public record types, canonical encoding,
+backend protocols, redaction helper, and tool-call cache. Workflow operation
+names such as ``plan`` and ``review`` are exported from
+:mod:`assay.primitives`, not from this module. Importing the tool-cache
+submodule initializes that package, so this statement describes the public
+namespace rather than lazy module loading. The filesystem store is exported
+from :mod:`assay.corpus`.
+"""
+
+from __future__ import annotations
+
+from ._safety import redact_secrets
+from .backend import (
+    BACKEND_CONFORMANCE_VERSION,
+    BACKEND_FEATURE_SCHEMA_VERSION,
+    Backend,
+    BackendFeatureSet,
+    CONSERVATIVE_BACKEND_FEATURES,
+    ChatToolsBackend,
+    FeatureAwareBackend,
+)
+from .primitives.tool_cache import ToolCallCache, canonical_args
+from .canonical import (
+    CONSTRAINT_TYPES,
+    CRITERION_TYPES,
+    hash_record,
+    parse,
+    serialize,
+)
+from .types import (
+    ADVISORY_KINDS,
+    ALL_VERDICT_KINDS,
+    FINDING_DISPOSITIONS,
+    REVIEW_DECISIONS,
+    ActivationConstraint,
+    AttackSpec,
+    AssertionCriterion,
+    BackendError,
+    BACKEND_EXECUTION_TRACE_VERSION,
+    BackendExecutionEvent,
+    BackendExecutionTrace,
+    BackendPolicy,
+    BenchConfig,
+    BlastRadiusConstraint,
+    BudgetConstraint,
+    BudgetExhausted,
+    ContentHash,
+    ContentRejected,
+    Constraint,
+    CONVERSATION_HANDLE_SCHEMA_VERSION,
+    ConversationHandle,
+    ConversationIdentity,
+    ConversationMode,
+    ConversationRecoveryDisposition,
+    ConversationRecoveryResolution,
+    ConversationResumeAction,
+    ConversationResumeDecision,
+    ConversationResumeScope,
+    ConversationState,
+    ConversationTransportAction,
+    ConversationTransportOutcome,
+    ConversationTransportRequest,
+    Criterion,
+    CriterionOutcome,
+    CriterionResult,
+    Evidence,
+    GATE_KINDS,
+    ExecutionContext,
+    ExternalCancellation,
+    ExecutionCompleteness,
+    Finding,
+    FindingDisposition,
+    Implementation,
+    ImplementationDirective,
+    Invocation,
+    InvocationResult,
+    IncompleteEvidence,
+    LifecycleEvent,
+    MaxTurnsExceeded,
+    Measurement,
+    Message,
+    MutationRegion,
+    ReadOnlySourceReference,
+    PendingConversationOperation,
+    PendingConversationOperationState,
+    ParityCriterion,
+    PlanPolicy,
+    PlanDecision,
+    PlanOutcome,
+    ProjectContext,
+    Proposal,
+    ReviewCoverage,
+    ReviewDecision,
+    RuleContext,
+    Rubric,
+    Slice,
+    SmokeResult,
+    Spec,
+    Tier,
+    TierDAG,
+    Tool,
+    ToolSet,
+    TransportError,
+    StaleConversation,
+    UnknownConstraintKind,
+    Usage,
+    UsageCostBoundSegment,
+    UsageCostBounds,
+    combine_cost_bounds,
+    cost_bounds_cover,
+    UsagePricingEvidence,
+    UsagePricingSegment,
+    ValidationRuleset,
+    Verdict,
+    advance_conversation_handle,
+    decide_conversation_resume,
+    mark_conversation_state,
+    new_conversation_handle,
+    RESULT_EVIDENCE_ADMISSION_MODES,
+    ResultEvidenceAdmission,
+    admit_result_evidence,
+    missing_execution_evidence,
+)
+
+# protocol.py keeps these imports type-only to avoid a backend→primitives
+# package cycle during initialization. Populate its annotation globals after
+# the public leaf types are loaded so get_type_hints() remains compatible.
+from .backend import protocol as _backend_protocol
+
+_backend_protocol.ToolCallCache = ToolCallCache
+_backend_protocol.ToolSet = ToolSet
+
+__all__ = [
+    # safety
+    "redact_secrets",
+    # canonical
+    "serialize",
+    "parse",
+    "hash_record",
+    "CONSTRAINT_TYPES",
+    "CRITERION_TYPES",
+    # backend
+    "Backend",
+    "BACKEND_CONFORMANCE_VERSION",
+    "BACKEND_EXECUTION_TRACE_VERSION",
+    "BACKEND_FEATURE_SCHEMA_VERSION",
+    "BackendExecutionEvent",
+    "BackendExecutionTrace",
+    "BackendFeatureSet",
+    "CONSERVATIVE_BACKEND_FEATURES",
+    "ChatToolsBackend",
+    "FeatureAwareBackend",
+    # identity
+    "ContentHash",
+    "ProjectContext",
+    # execution
+    "ExecutionContext",
+    # conversation continuity
+    "CONVERSATION_HANDLE_SCHEMA_VERSION",
+    "ConversationHandle",
+    "ConversationIdentity",
+    "ConversationMode",
+    "ConversationRecoveryDisposition",
+    "ConversationRecoveryResolution",
+    "ConversationResumeAction",
+    "ConversationResumeDecision",
+    "ConversationResumeScope",
+    "ConversationState",
+    "ConversationTransportAction",
+    "ConversationTransportOutcome",
+    "ConversationTransportRequest",
+    "PendingConversationOperation",
+    "PendingConversationOperationState",
+    "advance_conversation_handle",
+    "decide_conversation_resume",
+    "mark_conversation_state",
+    "new_conversation_handle",
+    # constraints / criteria
+    "Constraint",
+    "ActivationConstraint",
+    "BudgetConstraint",
+    "BlastRadiusConstraint",
+    "Criterion",
+    "AssertionCriterion",
+    "ParityCriterion",
+    # policy
+    "PlanPolicy",
+    "PlanDecision",
+    "PlanOutcome",
+    "BackendPolicy",
+    # rubric
+    "Rubric",
+    # findings / verdicts
+    "Evidence",
+    "CriterionResult",
+    "CriterionOutcome",
+    "Proposal",
+    "AttackSpec",
+    "Finding",
+    "Verdict",
+    "ReviewCoverage",
+    "ReviewDecision",
+    "FindingDisposition",
+    "REVIEW_DECISIONS",
+    "FINDING_DISPOSITIONS",
+    "ValidationRuleset",
+    "RuleContext",
+    "ADVISORY_KINDS",
+    "GATE_KINDS",
+    "ALL_VERDICT_KINDS",
+    # tools
+    "Tool",
+    "ToolSet",
+    "ToolCallCache",
+    "canonical_args",
+    # invocation
+    "Invocation",
+    "InvocationResult",
+    "Usage",
+    "UsageCostBoundSegment",
+    "UsageCostBounds",
+    "combine_cost_bounds",
+    "cost_bounds_cover",
+    "UsagePricingEvidence",
+    "UsagePricingSegment",
+    "Message",
+    "BackendError",
+    "TransportError",
+    "BudgetExhausted",
+    "MaxTurnsExceeded",
+    "ContentRejected",
+    "ExternalCancellation",
+    "IncompleteEvidence",
+    "StaleConversation",
+    "ExecutionCompleteness",
+    "RESULT_EVIDENCE_ADMISSION_MODES",
+    "ResultEvidenceAdmission",
+    "admit_result_evidence",
+    "missing_execution_evidence",
+    # smoke
+    "SmokeResult",
+    # dag
+    "ImplementationDirective",
+    "MutationRegion",
+    "ReadOnlySourceReference",
+    "Slice",
+    "Tier",
+    "TierDAG",
+    # artifacts
+    "Implementation",
+    "Measurement",
+    "LifecycleEvent",
+    # bench
+    "BenchConfig",
+    # spec
+    "Spec",
+    "UnknownConstraintKind",
+]

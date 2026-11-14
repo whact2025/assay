@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+include LICENSE
+include uv.lock uv.lock.license
+recursive-include docs *.md *.license
+recursive-include tests/fixtures *.json *.license

@@ -1,0 +1,53 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+[project]
+name = "assay"
+version = "0.0.0"
+description = "Typed, content-addressed primitives for evidence-backed engineering workflows."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+classifiers = [
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3 :: Only",
+]
+dependencies = [
+    "pyyaml>=6.0",
+]
+
+[project.urls]
+Repository = "https://github.com/whact2025/assay"
+
+[dependency-groups]
+dev = [
+    "pytest>=7",
+]
+
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+# src/ layout: the importable package lives under src/assay/, not at the
+# repository root. Subpackages separate records, persistence, primitives,
+# canonical encoding, and backend protocols.
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["assay*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+# ruff is installed transiently in CI via `uv run --with ruff` (not a
+# project dependency). Config below pins the lint contract.
+[tool.ruff]
+# Keep the CI lint contract explicit; widen the ruleset deliberately.
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# Start with pyflakes (F) + a curated pycodestyle (E) subset — the rules
+# that catch real defects (undefined names, unused imports, bad import
+# placement) without imposing whitespace churn on the existing tree.
+select = ["F", "E4", "E7", "E9"]

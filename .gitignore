@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# Crucible per-product state and plans are operator-local; not tracked.
+# Plans/goals are operator-local per the architecture's git-tracking
+# policy (arch §4.2.0.1 covers specs/ at workspace level; assay's own
+# .crucible/ follows the same discipline).
+.crucible/
+
+# Python build artifacts and venv conventions
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+.pytest_cache/
+pytest-of-*/
+.ruff_cache/
+.mypy_cache/
+
+# Editor / OS noise
+.DS_Store
+*.swp

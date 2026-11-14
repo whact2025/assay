@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+name: ci
+
+# Run the CPU-only test suite and production-tree Ruff contract through uv on
+# every main-branch push and pull request.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - name: Lint (ruff, production tree)
+        run: uv run --with ruff ruff check src
+      - name: Tests
+        run: uv run pytest -q
