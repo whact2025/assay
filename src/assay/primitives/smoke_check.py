@@ -158,7 +158,11 @@ def _infrastructure_failure(
     """Encode a required check that produced no verdict about the code.
 
     The ``<language>: <reason>`` line always survives truncation; the tool
-    output is tail-bounded into the remaining excerpt budget.
+    output is tail-bounded into the remaining excerpt budget. The excerpt is
+    bounded in tool-output bytes: the tail is cut before it is decoded, so a
+    multi-byte character split by the cut, or output that is not UTF-8, is
+    decoded to U+FFFD and the encoded excerpt can then be longer than
+    ``SMOKE_LOG_MAX_BYTES``.
     """
 
     headline = f"{language}: {reason}"

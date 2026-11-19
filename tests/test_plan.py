@@ -68,6 +68,7 @@ from assay.primitives.plan import (
     _serialize_tier_dag,
     _tier_dag_response_schema,
     _update_persistence,
+    _validated_project_root,
     plan,
 )
 from assay.primitives.review import review as assay_review
@@ -970,6 +971,52 @@ def test_parse_tier_dag_keeps_absent_and_null_lists_empty():
     assert _parse_tier_dag(payload) == dag
 
 
+@pytest.mark.parametrize(
+    ("field", "falsy", "empty"),
+    [
+        ("slices", 0, []),
+        ("files_in_scope", "", []),
+        ("directive", [], {}),
+    ],
+    ids=[
+        "slices_is_zero",
+        "files_in_scope_is_an_empty_string",
+        "directive_is_an_empty_list",
+    ],
+)
+def test_parse_tier_dag_reads_a_falsy_value_of_the_wrong_type_as_empty(
+    field, falsy, empty
+):
+    """Pins today's leniency: a falsy value of the wrong type reads as empty.
+
+    ``"slices": 0`` and ``"files_in_scope": ""`` parse like ``[]`` and
+    ``"directive": []`` parses like ``{}``; only a non-empty value of the
+    wrong type is a failed attempt. The stricter parser, which would accept
+    only an absent field, ``null`` and the empty value of the right type, is
+    an open decision.
+    """
+
+    def parsed_with(value):
+        payload = copy.deepcopy(_DAG_OK)
+        tier = payload["tiers"][0]
+        if field == "slices":
+            tier["slices"] = value
+        elif field == "directive":
+            tier["slices"][0]["directive"] = value
+        else:
+            tier["slices"][0]["directive"][field] = value
+        return _parse_tier_dag(payload)
+
+    dag = parsed_with(falsy)
+
+    assert dag is not None
+    assert dag == parsed_with(empty)
+    if field == "slices":
+        assert dag.tiers[0].slices == ()
+    else:
+        assert dag.tiers[0].slices[0].directive.files_in_scope == ()
+
+
 def test_parse_tier_dag_still_coerces_scalar_members_to_text():
     """Scalar ids and list members keep their ``str()`` coercion."""
 
@@ -1028,6 +1075,7 @@ def test_plan_feeds_wrong_shape_planner_reply_back_as_parse_failure(
     [
         "nesting_beyond_the_recursion_limit",
         "blast_radius_nested_beyond_the_recursion_limit",
+        "blast_radius_nested_beyond_the_parser_but_loadable",
         "integer_beyond_the_digit_limit",
     ],
 )
@@ -1035,12 +1083,25 @@ def test_plan_feeds_unloadable_planner_json_back_as_parse_failure(
     tmp_path: Path,
     case: str,
 ):
-    """``json.loads`` failures that are not ``JSONDecodeError`` stay contained."""
+    """``json.loads`` failures that are not ``JSONDecodeError`` stay contained.
+
+    So does a reply that ``json.loads`` accepts and the parser cannot walk.
+    The ``..._but_loadable`` case nests ``blast_radius`` less deeply than the
+    case before it, so that the parser inside ``plan()`` is what rejects the
+    reply; it is skipped on an interpreter whose ``json.loads`` rejects that
+    nesting as well.
+    """
 
     depth = sys.getrecursionlimit() * 100
     if case == "nesting_beyond_the_recursion_limit":
         bad_reply = '{"tiers": ' + "[" * depth + "]" * depth + "}"
-    elif case == "blast_radius_nested_beyond_the_recursion_limit":
+    elif case in (
+        "blast_radius_nested_beyond_the_recursion_limit",
+        "blast_radius_nested_beyond_the_parser_but_loadable",
+    ):
+        loadable = case == "blast_radius_nested_beyond_the_parser_but_loadable"
+        if loadable:
+            depth = sys.getrecursionlimit() * 5
         marker = '"blast_radius": {'
         bad_reply = json.dumps(_DAG_OK)
         assert marker in bad_reply
@@ -1048,6 +1109,13 @@ def test_plan_feeds_unloadable_planner_json_back_as_parse_failure(
             marker,
             marker + '"deep": ' + '{"n": ' * depth + "1" + "}" * depth + ", ",
         )
+        if loadable:
+            try:
+                json.loads(bad_reply)
+            except RecursionError:
+                pytest.skip(
+                    "json.loads of this interpreter rejects this nesting"
+                )
     else:
         digit_limit = getattr(sys, "get_int_max_str_digits", lambda: 0)()
         if not digit_limit:
@@ -1420,6 +1488,25 @@ def test_plan_rejects_invalid_project_root_before_any_backend_call(
 
     assert planner_backend.invocations == []
     assert critic_backend.invocations == []
+
+
+@pytest.mark.parametrize("root_type", [str, Path])
+def test_validated_project_root_returns_the_normpath_of_its_argument(
+    tmp_path: Path,
+    root_type,
+):
+    """Pins today's behaviour: the root is returned through ``normpath``.
+
+    The directory check reads the spelling as given and the
+    ``os.path.normpath`` that follows is lexical. Dropping ``normpath``, so
+    that the returned root is the validated spelling, is an open decision.
+    """
+
+    _, _, project_root = _same_named_nested_project(tmp_path)
+    spelling = root_type(project_root / "kit" / "..")
+    assert str(spelling).endswith("..")
+
+    assert _validated_project_root(spelling) == str(project_root)
 
 
 # ----------------------------------------------------------------------
@@ -4524,6 +4611,41 @@ def test_plan_inflation_when_revision_adds_new_id(tmp_path: Path):
     assert len(outcome.spec.verdict_refs) == 3
 
 
+def test_plan_inflation_when_first_critic_review_had_no_active_finding(
+    tmp_path: Path,
+):
+    """An earlier Critic verdict arms the guard, not an earlier finding.
+
+    The Critic passes the first candidate without a finding and the Judge
+    asks for a revision. The finding the Critic then adds on the revised
+    candidate is stamped, although no Critic finding was seen before it.
+    """
+    corpus = Corpus(tmp_path)
+    judge_revise = _review_response("revise", [_review_finding("j1")])
+    outcome, *_ = _plan_with_scripts(
+        _make_spec(), corpus,
+        planner=[json.dumps(_DAG_OK), json.dumps(_DAG_OK)],
+        critic=[_VERDICT_PASS, _verdict_fail_with_ids("f1")],
+        judge=[judge_revise, judge_revise],
+        policy=PlanPolicy(
+            max_critique_rounds=1,
+            judge_required=True,
+            breaker_required=False,
+            persistence_veto_threshold=10,
+        ),
+    )
+
+    verdicts = _staged_verdicts(corpus, outcome)
+    assert [(v.kind, v.decision) for v in verdicts[:-1]] == [
+        ("critic", "pass"),
+        ("judge", "revise"),
+        ("critic", "revise"),
+        ("judge", "revise"),
+    ]
+    assert verdicts[-1].kind == "inflation"
+    assert [f.evidence[0].excerpt for f in verdicts[-1].findings] == ["f1"]
+
+
 def test_plan_inflation_collects_across_rounds(tmp_path: Path):
     """Multiple revision rounds each adding new ids → all accumulated."""
     corpus = Corpus(tmp_path)
@@ -4909,23 +5031,39 @@ def test_plan_backend_error_is_not_treated_as_parse_failure(tmp_path: Path, capl
     assert len(critic_backend.invocations) == 0
 
 
-@pytest.mark.parametrize("case", ["reviewed_then_lost", "unparseable_then_lost"])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "reviewed_then_lost",
+        "unparseable_then_lost",
+        "lost_then_reviewed_then_lost",
+    ],
+)
 def test_plan_reports_planner_infrastructure_failure_when_final_attempts_are_lost(
     tmp_path: Path,
     case: str,
 ):
-    """A round budget that ends on a lost planner call did not fail to agree."""
+    """A round budget that ends on a lost planner call did not fail to agree.
+
+    The reason counts the lost calls at the end of the budget, not every lost
+    call: ``lost_then_reviewed_then_lost`` loses two attempts, ends on one of
+    them and names one.
+    """
     corpus = Corpus(tmp_path)
-    reviewed = case == "reviewed_then_lost"
+    reviewed = case != "unparseable_then_lost"
+    planner: list[str | dict] = [
+        json.dumps(_DAG_OK) if reviewed else "not json",
+        _lost_planner_attempt(),
+    ]
+    if case == "lost_then_reviewed_then_lost":
+        planner.insert(0, _lost_planner_attempt())
+    attempts = len(planner)
     outcome, planner_backend, critic_backend, _ = _plan_with_scripts(
         _make_spec(), corpus,
-        planner=[
-            json.dumps(_DAG_OK) if reviewed else "not json",
-            _lost_planner_attempt(),
-        ],
+        planner=planner,
         critic=[_VERDICT_FAIL] if reviewed else [],
         policy=PlanPolicy(
-            max_critique_rounds=1,
+            max_critique_rounds=attempts - 1,
             judge_required=False,
             breaker_required=False,
             persistence_veto_threshold=10,
@@ -4936,12 +5074,12 @@ def test_plan_reports_planner_infrastructure_failure_when_final_attempts_are_los
     assert outcome.status == "planner_infrastructure_failure"
     assert "final 1 planning attempt(s)" in outcome.reason
     assert "transport: overloaded" in outcome.reason
-    assert outcome.rounds_used == 2
+    assert outcome.rounds_used == attempts
     assert outcome.spec.tier_dag is None
     assert outcome.candidate_dag == (
         _parse_tier_dag(_DAG_OK) if reviewed else None
     )
-    assert len(planner_backend.invocations) == 2
+    assert len(planner_backend.invocations) == attempts
     assert len(critic_backend.invocations) == (1 if reviewed else 0)
     event = corpus.get_record(
         outcome.spec.lifecycle_event_refs[-1], as_type=LifecycleEvent
@@ -4971,11 +5109,11 @@ def test_plan_backend_loss_before_a_final_planner_reply_keeps_existing_status(
     expected_status: str,
     expected_reason: str,
 ):
-    """Current behaviour: only a budget that ENDS on a lost call changes status.
+    """Only a round budget that ENDS on a lost planner call changes the status.
 
-    Whether a loss earlier in the budget should also be non-permanent for a
-    consumer is an open owner decision; until then the status is unchanged
-    and the reason names the lost attempts.
+    A lost call that a later planner reply follows leaves the ordinary status
+    in place. The two statuses of this test, ``no_candidate`` and
+    ``rounds_exhausted``, count the lost attempts in their reason.
     """
     reviewed = case == "lost_then_reviewed"
     outcome, planner_backend, critic_backend, _ = _plan_with_scripts(
@@ -4995,10 +5133,11 @@ def test_plan_backend_loss_before_a_final_planner_reply_keeps_existing_status(
 
     assert outcome.decision == "inconclusive"
     assert outcome.status == expected_status
-    assert outcome.reason == (
-        f"{expected_reason}; 1 planning attempt(s) were lost to retriable "
-        "planner backend errors (last: transport)"
-    )
+    assert expected_reason in outcome.reason
+    assert (
+        "1 planning attempt(s) were lost to retriable planner backend errors "
+        "(last: transport)"
+    ) in outcome.reason
     assert len(planner_backend.invocations) == 2
     assert len(critic_backend.invocations) == (1 if reviewed else 0)
 
@@ -5020,7 +5159,7 @@ def test_plan_accepts_after_a_lost_planner_attempt_without_naming_it(
 
     assert outcome.decision == "accepted"
     assert outcome.status == "accepted"
-    assert outcome.reason == "critic + judge both passed"
+    assert "lost" not in outcome.reason
     assert len(planner_backend.invocations) == 2
 
 

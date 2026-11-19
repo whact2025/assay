@@ -697,9 +697,11 @@ Generated scope paths are canonicalized against the explicit `project_root=`
 directory, never the process working directory. A leading
 `<submodule_path or project>/` segment is removed unless that existing absolute
 directory holds a directory of the same name; it is then kept on every path,
-existing or new, and a path that only repeats the name is left for the
-consumer's candidate validator to report. Without `project_root` the segment
-is always removed. An invalid root raises before any backend call.
+existing or new. A `files_in_scope` entry that only repeats the name is left
+for the consumer's candidate validator to report; a `creates_paths` entry
+cannot be told apart from a new file below that directory and is kept as
+written. Without `project_root` the segment is always removed. An invalid root
+raises before any backend call.
 
 Directives may carry typed `read_only_references` to existing source or tests:
 stable `reference_id`, project-relative normalized POSIX `path`, whole-file
@@ -727,13 +729,14 @@ directive shapes, but the parser remains tolerant enough that a workflow must
 not treat schema advertisement alone as validation.
 
 The parser treats non-JSON, incomplete objects, and parseable JSON of the wrong
-shape as failed plan attempts that are fed back to the Planner: a slice,
-directive, or `blast_radius` that is not an object; a list field that is not an
-array (a bare string is never split into characters); an object or array where
-a path, tier dependency, or requirement reference is expected; text that cannot
-be encoded as UTF-8; and nesting or integer literals beyond the interpreter's
-limits. Identifiers, `intent`, `verify_mode`, and scalar array members are
-still coerced with `str()`, and nesting depth has no explicit bound of its own.
+shape as failed plan attempts that are fed back to the Planner: a slice, or a
+non-empty directive or `blast_radius`, that is not an object; a non-empty list
+field that is not an array (a bare string is never split into characters); an
+object or array where a path, tier dependency, or requirement reference is
+expected; text that cannot be encoded as UTF-8; and nesting or integer literals
+beyond the interpreter's limits. Identifiers, `intent`, `verify_mode`, and
+scalar array members are still coerced with `str()`, and nesting depth has no
+explicit bound of its own.
 Backend response schemas are defense in depth; callers must still contain
 backend exceptions and other unexpected failures at the workflow boundary.
 
@@ -761,8 +764,9 @@ inclusive aggregate usage.
 A retriable Planner backend error costs the attempt it occurred in. When the
 round budget ends on such an attempt the outcome is `inconclusive` with status
 `planner_infrastructure_failure`, never `no_candidate` or `rounds_exhausted`.
-When a later attempt still received a Planner reply the ordinary status stands
-and its reason counts the lost attempts.
+When a later attempt still received a Planner reply the ordinary status
+stands; only the reasons of `rounds_exhausted` and `no_candidate` count the
+lost attempts.
 
 ## Backends, invocations, and tools
 

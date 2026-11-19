@@ -802,6 +802,11 @@ def test_python_syntax_floor_ignores_site_customization_in_checked_tree(
     imports ``site``, which processes that file and then imports
     ``sitecustomize`` from the tree; there the module can replace the compiler
     and pass a file that does not compile.
+
+    An interpreter that ships a ``sitecustomize`` of its own imports that one
+    instead. The one that Debian and Ubuntu package imports
+    ``apport_python_hook`` and calls its ``install``, so the tree holds the
+    same recording module under that name as well.
     """
 
     environment = tmp_path / "environment"
@@ -816,20 +821,28 @@ def test_python_syntax_floor_ignores_site_customization_in_checked_tree(
     package_root.mkdir(parents=True)
     executed = tmp_path / "sitecustomize-executed"
     (site_packages / "__editable__.tree.pth").write_text(f"{package_root}\n")
-    (package_root / "sitecustomize.py").write_text(
+    recording_module = (
         "import pathlib\n"
         "import py_compile\n"
         f"pathlib.Path({str(executed)!r}).write_text('ran')\n"
         "py_compile.compile = lambda *args, **kwargs: None\n"
     )
+    (package_root / "sitecustomize.py").write_text(recording_module)
+    (package_root / "apport_python_hook.py").write_text(
+        recording_module + "def install():\n    pass\n"
+    )
     (package_root / "broken.py").write_text("def broken(:\n    return\n")
-    # Control: with ``site`` enabled this interpreter imports the module.
+    # Control: with ``site`` enabled this interpreter imports one of the two
+    # modules.
     subprocess.run(
         [str(interpreter), "-I", "-c", "pass"],
         capture_output=True, check=True,
     )
     if not executed.exists():
-        pytest.skip("the interpreter ships a sitecustomize of its own")
+        pytest.skip(
+            "the interpreter imports neither sitecustomize nor "
+            "apport_python_hook from the tree"
+        )
     executed.unlink()
     monkeypatch.setattr(sys, "executable", str(interpreter))
     monkeypatch.setattr(
@@ -1576,6 +1589,10 @@ Caused by:
         b"    |          ^\n"
         b"  unclosed array table, expected `]]`\n"
     ),
+    # Constructed: the ``type_error`` output repeated until it is more than
+    # four times as long as the excerpt bound, so the excerpt has to be cut.
+    "more_output_than_the_excerpt_bound": _RUSTC_TYPE_ERROR
+    * (4 * SMOKE_LOG_MAX_BYTES // len(_RUSTC_TYPE_ERROR) + 1),
 }
 
 # Verbatim cargo 1.95.0 output (paths shortened). The first names the manifest
@@ -1837,6 +1854,9 @@ def test_rust_source_diagnostic_is_code_failure(tmp_path: Path, case: str) -> No
     # The excerpt is the toolchain's own output, not a gate reason line.
     assert not result.log_excerpt.startswith("rust: ")
     assert result.log_excerpt.strip()
+    # For ASCII output it never exceeds the excerpt bound, however long that
+    # output is.
+    assert len(result.log_excerpt.encode("utf-8")) <= SMOKE_LOG_MAX_BYTES
 
 
 def test_rust_source_diagnostic_on_stdout_is_code_failure(tmp_path: Path) -> None:
@@ -1850,6 +1870,32 @@ def test_rust_source_diagnostic_on_stdout_is_code_failure(tmp_path: Path) -> Non
 
     assert result.passed is False
     assert result.infrastructure_failure is False
+    assert "E0425" in result.log_excerpt
+    assert "src/lib.rs:2:5" in result.log_excerpt
+
+
+def test_rust_source_diagnostic_on_stderr_with_stdout_output_is_code_failure(
+    tmp_path: Path,
+) -> None:
+    """Output on stdout does not hide the diagnostic on stderr.
+
+    Both streams are scanned for the diagnostic and both are kept in the
+    excerpt.
+    """
+
+    runner = _scripted_runner({
+        "cargo": (101, b"a line printed on stdout\n", _RUSTC_TYPE_ERROR),
+    })
+
+    result = smoke_check(
+        _directive(files_in_scope=("src/lib.rs",)),
+        cwd=str(tmp_path),
+        process_runner=runner,
+    )
+
+    assert result.passed is False
+    assert result.infrastructure_failure is False
+    assert "a line printed on stdout" in result.log_excerpt
     assert "E0425" in result.log_excerpt
     assert "src/lib.rs:2:5" in result.log_excerpt
 

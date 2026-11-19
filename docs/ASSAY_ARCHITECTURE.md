@@ -1180,11 +1180,13 @@ paths are normalized to the project execution root: a leading
 `project_root`, an existing absolute directory, holds a directory of that
 name. The segment is then kept on every path, existing or new, so one
 candidate is never split between kept and stripped spellings; a path that only
-repeats the name is not rewritten and is left to the consumer's candidate
-validator. Without `project_root` the segment is always removed; the process
-working directory is never consulted. A parsed candidate can be
-passed through one caller-supplied `candidate_transform`; an exception or
-non-DAG return ends inconclusively before review.
+repeats the name is not rewritten. A `files_in_scope` entry that only repeats
+the name is left for the consumer's candidate validator to report; a
+`creates_paths` entry cannot be told apart from a new file below that
+directory and is kept as written. Without `project_root` the segment is always
+removed; the process working directory is never consulted. A parsed candidate
+can be passed through one caller-supplied `candidate_transform`; an exception
+or non-DAG return ends inconclusively before review.
 
 After candidate admission, an optional `candidate_context_provider` captures
 consumer-verified source context once for the Critic/Judge pair. Its immutable
@@ -1229,13 +1231,13 @@ text is rewritten and no generated feedback becomes requirement authority.
 
 The fallback parser turns non-JSON, missing structures, and parseable JSON of
 the wrong shape into a failed attempt that is fed back to the Planner. A slice,
-directive, or `blast_radius` must be an object and a list field an array; an
-array member that is itself an object or array, text that cannot be encoded as
-UTF-8, and nesting or integer literals beyond the interpreter's limits are
-rejected the same way. Identifiers, `intent`, `verify_mode`, and scalar array
-members are coerced with `str()`, and nesting depth has no explicit bound of
-its own. A workflow must contain backend exceptions and other unexpected
-failures.
+or a non-empty directive or `blast_radius`, must be an object and a non-empty
+list field an array; an array member that is itself an object or array, text
+that cannot be encoded as UTF-8, and nesting or integer literals beyond the
+interpreter's limits are rejected the same way. Identifiers, `intent`,
+`verify_mode`, and scalar array members are coerced with `str()`, and nesting
+depth has no explicit bound of its own. A workflow must contain backend
+exceptions and other unexpected failures.
 
 The candidate then receives critic review and, when required, independent judge
 review. Plan tracks full role history, active finding lineages, consecutive
@@ -1286,8 +1288,8 @@ A retriable Planner backend error consumes the attempt it occurred in. If the
 round budget ends on such an attempt, the outcome is `inconclusive` with status
 `planner_infrastructure_failure` rather than `no_candidate` or
 `rounds_exhausted`, and a reviewed candidate stays diagnostic. When a later
-attempt received a Planner reply, the ordinary status stands and its reason
-counts the lost attempts.
+attempt received a Planner reply, the ordinary status stands; only the reasons
+of `rounds_exhausted` and `no_candidate` count the lost attempts.
 
 `plan` persists planner/reviewer transcripts, candidate bytes, Verdict records,
 inflation records, and the terminal lifecycle event through the Corpus. It does
