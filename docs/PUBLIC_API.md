@@ -221,22 +221,25 @@ directory that generated scope paths are relative to. A leading
 a directory of the same name, and then on every path: an existing file and a
 new file below it stay together. A path that only repeats the name is not
 rewritten in that case; `plan` checks no path for existence, so a
-`candidate_validator` must report it. `None` always strips the segment. The
+`candidate_validator` must report a `files_in_scope` entry that only repeats
+the name. A `creates_paths` entry cannot be told apart from a new file below
+that directory and is kept as written. `None` always strips the segment. The
 process working directory is never consulted, an invalid root raises
 `ValueError` or `TypeError` before any backend call, and fixed-candidate
 review does not use it.
 
 The planner invocation advertises a strict response schema, and the fallback
 parser rejects a reply of the wrong shape instead of raising or guessing.
-Non-JSON, a slice, directive or `blast_radius` that is not an object, a list
-field that is not an array, an object or array used as a path, dependency or
-requirement reference, text that is not UTF-8 encodable, and nesting or
-integer literals beyond the interpreter's limits all become failed attempts
-fed back to the Planner. Identifiers, `intent`, `verify_mode` and scalar array
-members are coerced with `str()`; nesting depth has no explicit bound of its
-own. Callers must contain backend exceptions and other unexpected failures and
-call `TierDAG.topo_order()` before execution because `plan` does not gate
-unknown dependencies or cycles.
+Non-JSON, a slice that is not an object, a non-empty directive or
+`blast_radius` that is not an object, a non-empty list field that is not an
+array, an object or array used as a path, dependency or requirement reference,
+text that is not UTF-8 encodable, and nesting or integer literals beyond the
+interpreter's limits all become failed attempts fed back to the Planner.
+Identifiers, `intent`, `verify_mode` and scalar array members are coerced with
+`str()`; nesting depth has no explicit bound of its own. Callers must contain
+backend exceptions and other unexpected failures and call
+`TierDAG.topo_order()` before execution because `plan` does not gate unknown
+dependencies or cycles.
 `PlanPolicy.breaker_required` is currently carried as consumer metadata; this
 primitive does not route or execute a breaker role.
 

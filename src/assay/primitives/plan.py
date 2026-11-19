@@ -538,9 +538,11 @@ def _canonicalize_scope_path(
     project-root-relative path, for a file that exists and for one a slice
     creates alike, so every path keeps it: one candidate is never split
     between kept and stripped spellings, and a path that merely repeats the
-    name is left for the consumer's deterministic scope gate to report rather
-    than guessed at here. Empty or absent prefixes are no-ops, and backslashes
-    are normalized first.
+    name is not guessed at here. A ``files_in_scope`` entry that only repeats
+    the name is left for the consumer's deterministic scope gate to report; a
+    ``creates_paths`` entry cannot be told apart from a new file below that
+    directory and is kept as written. Empty or absent prefixes are no-ops, and
+    backslashes are normalized first.
     """
     normalized = path.replace("\\", "/")
     # Preserve absolute spellings so the consumer's deterministic containment
@@ -589,8 +591,10 @@ def _validated_project_root(
 def _json_array(value: object) -> list:
     """Return one planner JSON array field; absent, null, or empty is ``[]``.
 
-    Any other non-array raises ``TypeError``: a bare string would be iterated
-    per character and an object would yield its keys.
+    Empty includes the falsy values of another type (``""``, ``0``, ``false``,
+    ``{}``). A non-empty value that is not an array (a non-empty string or
+    object, a nonzero number, ``true``) raises ``TypeError``: a bare string
+    would be iterated per character and an object would yield its keys.
     """
     if not value:
         return []
@@ -615,12 +619,13 @@ def _parse_tier_dag(
 ) -> TierDAG | None:
     """Lift a JSON payload into a TierDAG. Returns None on invalid shape.
 
-    A parseable payload of the wrong shape is no candidate: a slice,
-    directive, or ``blast_radius`` that is not an object, a list field that is
-    not an array, an array member that is itself an object or array, and a
-    candidate whose review bytes cannot be produced (text that is not UTF-8
-    encodable, nesting beyond the recursion limit) all return ``None``. The
-    planning loop feeds that back as ``planner_parse_failure``.
+    A parseable payload of the wrong shape is no candidate: a slice that is
+    not an object, a non-empty directive or ``blast_radius`` that is not an
+    object, a non-empty list field that is not an array, an array member that
+    is itself an object or array, and a candidate whose review bytes cannot be
+    produced (text that is not UTF-8 encodable, nesting beyond the recursion
+    limit) all return ``None``. The planning loop feeds that back as
+    ``planner_parse_failure``.
 
     ``strip_prefix`` (the project/submodule name) is stripped from a leading
     path segment of every ``files_in_scope`` / ``creates_paths`` entry so the
@@ -2129,12 +2134,14 @@ def plan(
     segment of a ``files_in_scope`` / ``creates_paths`` entry is removed unless
     this directory holds a directory of that name. Then the segment is kept on
     every entry, existing or not, so a new file stays beside the files it
-    belongs with; an entry that only repeats the name is not rewritten and is
-    left to the consumer's ``candidate_validator``. ``None`` supplies no such
-    proof: the segment is always removed. The process working directory is
-    never consulted. A relative path, a path that is not a directory, or a
-    non-path value raises before any backend call. Fixed-candidate review
-    parses nothing and does not use it.
+    belongs with; an entry that only repeats the name is not rewritten. A
+    ``files_in_scope`` entry that only repeats the name is left for the
+    consumer's ``candidate_validator`` to report; a ``creates_paths`` entry
+    cannot be told apart from a new file below that directory and is kept as
+    written. ``None`` supplies no such proof: the segment is always removed.
+    The process working directory is never consulted. A relative path, a path
+    that is not a directory, or a non-path value raises before any backend
+    call. Fixed-candidate review parses nothing and does not use it.
 
     ``candidate_transform`` optionally maps every parsed planner candidate to
     the :class:`TierDAG` used by all subsequent deterministic gates, reviews,
