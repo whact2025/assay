@@ -45,6 +45,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import re
 from collections.abc import Mapping
 from pathlib import Path
@@ -532,10 +533,14 @@ def _canonicalize_scope_path(
 
     A planner may prefix a scope with the project/submodule name even though
     Git and build commands run from that project's root. A leading
-    ``strip_prefix`` segment is removed unless ``base_dir`` proves the
-    unstripped spelling is a real path. The existence exception preserves
-    projects that legitimately contain a same-named nested directory. Empty or
-    absent prefixes are no-ops, and backslashes are normalized first.
+    ``strip_prefix`` segment is removed unless ``base_dir`` holds a directory
+    of that name. Such a directory makes the segment part of a legitimate
+    project-root-relative path, for a file that exists and for one a slice
+    creates alike, so every path keeps it: one candidate is never split
+    between kept and stripped spellings, and a path that merely repeats the
+    name is left for the consumer's deterministic scope gate to report rather
+    than guessed at here. Empty or absent prefixes are no-ops, and backslashes
+    are normalized first.
     """
     normalized = path.replace("\\", "/")
     # Preserve absolute spellings so the consumer's deterministic containment
@@ -548,13 +553,61 @@ def _canonicalize_scope_path(
         p = p[2:]
     sp = strip_prefix.replace("\\", "/").strip("/")
     if sp and p.startswith(sp + "/"):
-        if base_dir:
-            import os
-
-            if os.path.exists(os.path.join(base_dir, p)):
-                return p
+        if base_dir and os.path.isdir(os.path.join(base_dir, sp)):
+            return p
         p = p[len(sp) + 1 :]
     return p
+
+
+def _validated_project_root(
+    project_root: str | os.PathLike[str] | None,
+) -> str | None:
+    """Return the caller's absolute project root, or ``None`` when omitted.
+
+    A relative or empty root would be resolved against the process working
+    directory, the ambient state this parameter replaces, and a root that is
+    not a directory can never prove a nested path.
+    """
+    if project_root is None:
+        return None
+    if not isinstance(project_root, (str, os.PathLike)):
+        raise TypeError(
+            "project_root must be a str path, os.PathLike[str], or None"
+        )
+    root = os.fspath(project_root)
+    if not isinstance(root, str):
+        raise TypeError(
+            "project_root must be a str path, os.PathLike[str], or None"
+        )
+    if not os.path.isabs(root):
+        raise ValueError(f"project_root must be an absolute path, got {root!r}")
+    if not os.path.isdir(root):
+        raise ValueError(f"project_root is not an existing directory: {root!r}")
+    return os.path.normpath(root)
+
+
+def _json_array(value: object) -> list:
+    """Return one planner JSON array field; absent, null, or empty is ``[]``.
+
+    Any other non-array raises ``TypeError``: a bare string would be iterated
+    per character and an object would yield its keys.
+    """
+    if not value:
+        return []
+    if not isinstance(value, list):
+        raise TypeError(f"expected a JSON array, got {type(value).__name__}")
+    return value
+
+
+def _json_scalar_text(value: object) -> str:
+    """Return one planner array member as text.
+
+    Scalars keep their ``str()`` coercion. A nested object or array raises
+    ``TypeError``: its ``repr`` is not a path, tier id, or requirement quote.
+    """
+    if isinstance(value, (dict, list)):
+        raise TypeError(f"expected a JSON scalar, got {type(value).__name__}")
+    return str(value)
 
 
 def _parse_tier_dag(
@@ -562,11 +615,21 @@ def _parse_tier_dag(
 ) -> TierDAG | None:
     """Lift a JSON payload into a TierDAG. Returns None on invalid shape.
 
+    A parseable payload of the wrong shape is no candidate: a slice,
+    directive, or ``blast_radius`` that is not an object, a list field that is
+    not an array, an array member that is itself an object or array, and a
+    candidate whose review bytes cannot be produced (text that is not UTF-8
+    encodable, nesting beyond the recursion limit) all return ``None``. The
+    planning loop feeds that back as ``planner_parse_failure``.
+
     ``strip_prefix`` (the project/submodule name) is stripped from a leading
     path segment of every ``files_in_scope`` / ``creates_paths`` entry so the
     planner output is project-root-relative. ``base_dir`` lets the strip be
-    skipped when the same-named prefix is a real nested directory.
+    skipped, for every path alike, when the same-named prefix is a real nested
+    directory.
     """
+    if not isinstance(payload, dict):
+        return None
     raw_tiers = payload.get("tiers")
     if not isinstance(raw_tiers, list):
         return None
@@ -575,10 +638,16 @@ def _parse_tier_dag(
         if not isinstance(t_raw, dict):
             return None
         try:
-            slices_raw = t_raw.get("slices") or ()
             slices: list[Slice] = []
-            for s_raw in slices_raw:
+            for s_raw in _json_array(t_raw.get("slices")):
+                if not isinstance(s_raw, dict):
+                    return None
                 d_raw = s_raw.get("directive") or {}
+                if not isinstance(d_raw, dict):
+                    return None
+                blast_radius = d_raw.get("blast_radius") or {}
+                if not isinstance(blast_radius, dict):
+                    return None
                 raw_references = d_raw.get("read_only_references", [])
                 if not isinstance(raw_references, list):
                     return None
@@ -594,21 +663,26 @@ def _parse_tier_dag(
                     slice_id=str(d_raw.get("slice_id") or s_raw.get("id") or ""),
                     intent=str(d_raw.get("intent") or ""),
                     requirement_refs=tuple(
-                        str(ref) for ref in (d_raw.get("requirement_refs") or ())
+                        _json_scalar_text(ref)
+                        for ref in _json_array(d_raw.get("requirement_refs"))
                     ),
                     read_only_references=tuple(
                         ReadOnlySourceReference(**ref) for ref in raw_references
                     ),
                     files_in_scope=tuple(
-                        _canonicalize_scope_path(str(p), strip_prefix, base_dir)
-                        for p in (d_raw.get("files_in_scope") or ())
+                        _canonicalize_scope_path(
+                            _json_scalar_text(p), strip_prefix, base_dir
+                        )
+                        for p in _json_array(d_raw.get("files_in_scope"))
                     ),
                     creates_paths=tuple(
-                        _canonicalize_scope_path(str(p), strip_prefix, base_dir)
-                        for p in (d_raw.get("creates_paths") or ())
+                        _canonicalize_scope_path(
+                            _json_scalar_text(p), strip_prefix, base_dir
+                        )
+                        for p in _json_array(d_raw.get("creates_paths"))
                     ),
                     verify_mode=str(d_raw.get("verify_mode") or "tests"),
-                    blast_radius=dict(d_raw.get("blast_radius") or {}),
+                    blast_radius=dict(blast_radius),
                 )
                 slices.append(Slice(id=str(s_raw["id"]), directive=directive))
             tiers.append(
@@ -616,13 +690,25 @@ def _parse_tier_dag(
                     tier_id=str(t_raw["tier_id"]),
                     slices=tuple(slices),
                     depends_on=tuple(
-                        str(d) for d in (t_raw.get("depends_on") or ())
+                        _json_scalar_text(d)
+                        for d in _json_array(t_raw.get("depends_on"))
                     ),
                 )
             )
-        except (KeyError, TypeError, ValueError):
+        except (AttributeError, KeyError, RecursionError, TypeError, ValueError):
             return None
-    return TierDAG(tiers=tuple(tiers))
+    dag = TierDAG(tiers=tuple(tiers))
+    try:
+        # Reviews, candidate artifacts, and the revision handoff all persist
+        # these exact UTF-8 bytes. A JSON escape such as a lone surrogate
+        # parses but cannot be encoded, and a pathologically nested
+        # ``blast_radius`` cannot be walked; reject both here so the failure
+        # is one planning attempt and not an exception after paid Planner
+        # usage.
+        _serialize_tier_dag(dag)
+    except (RecursionError, TypeError, ValueError):
+        return None
+    return dag
 
 
 def _serialize_transcript(transcript: tuple[Message, ...]) -> bytes:
@@ -682,6 +768,7 @@ def _run_planner(
     tier_cap: int | None = None,
     compaction_required: bool = False,
     planner_guidance: str | None = None,
+    project_root: str | None = None,
 ) -> tuple[
     TierDAG | None,
     "ContentHash | None",
@@ -690,11 +777,16 @@ def _run_planner(
 ]:
     """Invoke the planner once.
 
+    ``project_root`` is the validated absolute directory the planner's scope
+    paths are relative to; ``None`` means no directory can prove that a
+    leading project/submodule-name segment names a real nested directory.
+
     Returns ``(parsed_dag, transcript_ref, backend_error, invocation_result)``.
     When
     ``parsed_dag`` is None, ``backend_error`` discriminates the cause:
     non-None → a backend transport/budget/cancel error; None → the
-    response was unparseable JSON. The invocation result is always returned so
+    response was not one TierDAG JSON object (unparseable, or parseable but of
+    the wrong shape). The invocation result is always returned so
     callers can account for usage and inspect the terminal stop reason.
     """
     tool_descriptors: tuple[Tool, ...] | None = (
@@ -735,7 +827,7 @@ def _run_planner(
     # Distinguish a backend error from a parse failure so the loop never feeds
     # a "your JSON was invalid" rebuke when the API itself failed.
     # error is not None  → backend transport/budget/cancel failure
-    # error is None, dag is None → genuine unparseable-JSON failure
+    # error is None, dag is None → unparseable or wrong-shape JSON
     if result.error is not None:
         logger.warning(
             "planner round %d returned backend error: %s",
@@ -743,21 +835,24 @@ def _run_planner(
         )
         return None, transcript_ref, result.error, result
 
-    payload = _extract_json_object(result.final_message)
+    try:
+        payload = _extract_json_object(result.final_message)
+    except (RecursionError, ValueError):
+        # ``json.loads`` reports nesting beyond the interpreter's recursion
+        # limit and an integer literal beyond its digit limit with these, not
+        # with ``JSONDecodeError``. Both are an unparseable planner reply.
+        payload = None
     if payload is None:
         return None, transcript_ref, None, result
     # Canonicalize planner paths to project-root-relative (strip a leading
     # submodule/project-name segment) so blast_radius / scope-escape / handoff
-    # all see a consistent convention.
+    # all see a consistent convention. Only the caller's explicit project root
+    # can prove that such a segment is a legitimate same-named nested
+    # directory; the process working directory is never consulted.
     pc = spec.project_context
     strip_prefix = pc.submodule_path or pc.project or ""
-    # Project root the build runs from = <cwd>/<submodule_path>. Plan runs from
-    # the workspace root, so this resolves a legitimate same-named nested
-    # directory against the real tree before deciding whether to strip it.
-    import os
-    base_dir = os.path.join(os.getcwd(), strip_prefix) if strip_prefix else os.getcwd()
     return (
-        _parse_tier_dag(payload, strip_prefix, base_dir),
+        _parse_tier_dag(payload, strip_prefix, project_root),
         transcript_ref,
         None,
         result,
@@ -2011,6 +2106,7 @@ def plan(
     budget_usd: float | None = None,
     allowed_tools: tuple[str, ...] | None = None,
     prompt_toolset: ToolSet | None = None,
+    project_root: str | os.PathLike[str] | None = None,
     candidate_transform: Callable[[TierDAG], TierDAG] | None = None,
     candidate_validator: Callable[[TierDAG], tuple[Finding, ...]] | None = None,
     candidate_context_provider: Callable[[TierDAG], Mapping[str, str]] | None = None,
@@ -2027,6 +2123,18 @@ def plan(
     ``prompt_toolset`` is metadata-only: it renders the exact consumer-owned
     catalogue already attached to ``planner_backend`` without changing tool
     authority or transport.
+
+    ``project_root`` is the existing absolute directory that generated planner
+    scope paths are relative to. A leading ``<submodule_path or project>/``
+    segment of a ``files_in_scope`` / ``creates_paths`` entry is removed unless
+    this directory holds a directory of that name. Then the segment is kept on
+    every entry, existing or not, so a new file stays beside the files it
+    belongs with; an entry that only repeats the name is not rewritten and is
+    left to the consumer's ``candidate_validator``. ``None`` supplies no such
+    proof: the segment is always removed. The process working directory is
+    never consulted. A relative path, a path that is not a directory, or a
+    non-path value raises before any backend call. Fixed-candidate review
+    parses nothing and does not use it.
 
     ``candidate_transform`` optionally maps every parsed planner candidate to
     the :class:`TierDAG` used by all subsequent deterministic gates, reviews,
@@ -2085,6 +2193,7 @@ def plan(
         raise ValueError("fixed candidate review does not permit Planner tools")
     if fixed_candidate and prompt_toolset is not None:
         raise ValueError("fixed candidate review does not permit a Planner ToolSet")
+    planner_project_root = _validated_project_root(project_root)
     effective_policy: PlanPolicy = (
         policy
         if policy is not None
@@ -2127,6 +2236,13 @@ def plan(
     pending_judge_feedback: list[Finding] = []
     consecutive_critic_failures = 0
     consecutive_judge_failures = 0
+    # Conclusive Critic verdicts so far; arms the revision-set inflation guard.
+    critic_reviews = 0
+    # Planning attempts that ended in a retriable planner backend error: the
+    # whole call, and the unbroken run since the last planner reply.
+    planner_attempts_lost = 0
+    trailing_planner_attempts_lost = 0
+    last_planner_backend_error: BackendError | None = None
     base_spec = spec
     new_spec = spec
     spent_usd = 0.0
@@ -2521,6 +2637,7 @@ def plan(
                 tier_cap=effective_policy.max_total_tiers,
                 compaction_required=is_compaction_attempt,
                 planner_guidance=effective_policy.planner_guidance,
+                project_root=planner_project_root,
             )
             record_model_usage(
                 planner_result.usage,
@@ -2597,7 +2714,13 @@ def plan(
                     "findings": [_finding_handoff(backend_finding)],
                 }
             )
+            planner_attempts_lost += 1
+            trailing_planner_attempts_lost += 1
+            last_planner_backend_error = planner_error
             continue
+        # The Planner replied (or the candidate is fixed): whatever ends the
+        # debate from here on is not an unanswered planner call.
+        trailing_planner_attempts_lost = 0
         if dag is None:
             # Planner couldn't produce a parseable DAG. Convert the
             # parse failure into a synthetic Critic finding and feed
@@ -2620,10 +2743,14 @@ def plan(
                         location=f"plan_round_{r}",
                         excerpt=(
                             "Your previous response was not valid "
-                            "JSON. Common causes: missing closing "
+                            "JSON or did not match the TierDAG "
+                            "schema (slices and directives are "
+                            "objects, list fields are arrays, text "
+                            "is valid Unicode). Common causes: missing closing "
                             "brace on a single-slice tier, "
                             "unescaped quote in `intent`, trailing "
-                            "comma. Re-emit the full DAG as a "
+                            "comma, a bare string where an array is "
+                            "required. Re-emit the full DAG as a "
                             "single JSON object, count braces, do "
                             "not abbreviate."
                         ),
@@ -2633,7 +2760,8 @@ def plan(
                     "re-emit a syntactically valid JSON object "
                     "matching the schema; double-check that every "
                     "slice has a closing `}` even when the tier "
-                    "has only one slice"
+                    "has only one slice, and that every list field "
+                    "is a JSON array"
                 ),
                 source="deterministic",
             )
@@ -3217,12 +3345,16 @@ def plan(
                 cost_usd=spent_usd,
             )
 
-        # Inflation guard. On revision rounds (r > 0), any critic finding id
-        # not seen in a prior round is "inflated": the Critic is
-        # expected to PERSIST or DISMISS prior findings, not invent new
-        # ones across rounds. Collected here and stamped as a single
-        # synthetic critic_inflation Verdict at every loop exit.
-        if r > 0:
+        # Inflation guard. Once the Critic has given a verdict on an earlier
+        # candidate of this debate, any critic finding id not seen in a prior
+        # review is "inflated": the Critic is expected to PERSIST or DISMISS
+        # prior findings, not invent new ones across rounds. The guard is
+        # keyed on prior Critic verdicts, not on the attempt index ``r``:
+        # ``r`` also counts attempts that never reached the Critic (planner
+        # backend/parse failures, deterministic repairs, compaction).
+        # Collected here and stamped as a single synthetic critic_inflation
+        # Verdict at every loop exit.
+        if critic_reviews > 0:
             for f in last_critic:
                 if not _is_active_finding(f):
                     continue
@@ -3237,6 +3369,10 @@ def plan(
             if not _is_active_finding(f):
                 continue
             first_seen_round.setdefault(_finding_semantic_key(f), r)
+        # An inconclusive Critic reply reviewed nothing, so it cannot make
+        # the next conclusive review a "revision" of its finding set.
+        if critic_verdict.decision != "inconclusive":
+            critic_reviews += 1
 
         # A required Judge always decides independently, including when the
         # Critic decided pass with no findings.
@@ -3563,6 +3699,38 @@ def plan(
 
     # Loop fell through (max rounds exhausted without consensus).  Preserve
     # the candidate for inspection but never attach it as executable state.
+    lost_attempts_note = ""
+    if last_planner_backend_error is not None:
+        lost_attempts_note = (
+            f"; {planner_attempts_lost} planning attempt(s) were lost to "
+            "retriable planner backend errors "
+            f"(last: {last_planner_backend_error.kind})"
+        )
+        if trailing_planner_attempts_lost:
+            # The round budget ended on an unanswered planner call. That is
+            # neither a planner that could not produce a candidate nor
+            # reviewers that could not agree, so it gets its own status. A
+            # reviewed candidate stays diagnostic; nothing becomes executable.
+            backend_detail = (
+                f"{last_planner_backend_error.kind}: "
+                f"{last_planner_backend_error.message}"
+            )[:500]
+            return finish(
+                _stamp_inflation_if_any(new_spec, inflation, corpus),
+                candidate_dag=last_bounded_dag or last_dag,
+                decision="inconclusive",
+                status="planner_infrastructure_failure",
+                rounds_used=attempts_used,
+                final_critic_decision=None,
+                final_judge_decision=None,
+                exit_reason=(
+                    "retriable planner backend errors left the final "
+                    f"{trailing_planner_attempts_lost} planning attempt(s) "
+                    "of the round budget without a planner reply "
+                    f"({backend_detail})"
+                ),
+                cost_usd=spent_usd,
+            )
     if last_dag is not None:
         new_spec = _stamp_inflation_if_any(new_spec, inflation, corpus)
         exhaustion_reason = f"max rounds ({rounds}) exhausted without consensus"
@@ -3591,7 +3759,7 @@ def plan(
             rounds_used=attempts_used,
             final_critic_decision=None,
             final_judge_decision=None,
-            exit_reason=exhaustion_reason,
+            exit_reason=exhaustion_reason + lost_attempts_note,
             cost_usd=spent_usd,
         )
     # No tier_dag ever produced.
@@ -3604,7 +3772,10 @@ def plan(
         rounds_used=attempts_used,
         final_critic_decision=None,
         final_judge_decision=None,
-        exit_reason="planner produced no safe bounded tier_dag in any round",
+        exit_reason=(
+            "planner produced no safe bounded tier_dag in any round"
+            + lost_attempts_note
+        ),
         cost_usd=spent_usd,
     )
 

@@ -215,13 +215,28 @@ without invoking reviewers. Consumers must render the supplied keys in their
 rubrics, retain source evidence, enforce capture bounds and revalidate source.
 The callback does not replace deterministic candidate validation.
 
-The planner invocation advertises a strict response schema, but the fallback
-parser does not validate every nested value before access/coercion. Non-JSON
-and ordinary parse failures become non-accepted outcomes; some structurally
-malformed nested JSON can propagate `AttributeError` or `ValueError`. Callers
-must contain unexpected backend/parser exceptions and call
-`TierDAG.topo_order()` before execution because `plan` does not gate unknown
-dependencies or cycles.
+`project_root: str | os.PathLike[str] | None` is the existing absolute
+directory that generated scope paths are relative to. A leading
+`<submodule_path or project>/` segment is kept only when that directory holds
+a directory of the same name, and then on every path: an existing file and a
+new file below it stay together. A path that only repeats the name is not
+rewritten in that case; `plan` checks no path for existence, so a
+`candidate_validator` must report it. `None` always strips the segment. The
+process working directory is never consulted, an invalid root raises
+`ValueError` or `TypeError` before any backend call, and fixed-candidate
+review does not use it.
+
+The planner invocation advertises a strict response schema, and the fallback
+parser rejects a reply of the wrong shape instead of raising or guessing.
+Non-JSON, a slice, directive or `blast_radius` that is not an object, a list
+field that is not an array, an object or array used as a path, dependency or
+requirement reference, text that is not UTF-8 encodable, and nesting or
+integer literals beyond the interpreter's limits all become failed attempts
+fed back to the Planner. Identifiers, `intent`, `verify_mode` and scalar array
+members are coerced with `str()`; nesting depth has no explicit bound of its
+own. Callers must contain backend exceptions and other unexpected failures and
+call `TierDAG.topo_order()` before execution because `plan` does not gate
+unknown dependencies or cycles.
 `PlanPolicy.breaker_required` is currently carried as consumer metadata; this
 primitive does not route or execute a breaker role.
 
@@ -321,10 +336,18 @@ bounded thread pool, and returns results in input order. Backend exceptions use
 
 `smoke_check` uses case-sensitive suffix matching and selects Rust before
 Python before the exact suffix set `.cpp`, `.cc`, `.cxx`, `.h`, `.hpp`, and
-`.cu`. Rust runs `cargo check`; Python runs `compileall` and, when available,
-Ruff's F rules; the listed C++/CUDA suffixes form an explicit skip-with-pass
-lane. Other C-family suffixes are unrecognized. Required-command failures are
-encoded in `SmokeResult`; optional Ruff absence/timeout is a soft pass.
+`.cu`. Rust runs `cargo check`; Python runs `compileall` in an isolated
+interpreter without `site` (`-I -S`) and, when available, Ruff's F rules; the
+listed C++/CUDA suffixes form an explicit skip-with-pass lane. Other C-family
+suffixes are unrecognized. Required-command failures are encoded in
+`SmokeResult`; optional Ruff absence/timeout is a soft pass.
+`SmokeResult.infrastructure_failure` is true for a failure that is not a
+verdict on the code: a missing required tool, a timeout, or an exit without the
+tool's verdict status. A `cargo check` exit 101 is attributed to the code only
+when its output contains an `error` diagnostic with a `-->` source span, or a
+TOML parse error that Cargo reports for the manifest or the lock file; the
+same parse error in a Cargo configuration file is flagged. The flag reports a
+missing verdict; it does not say that a retry would succeed.
 `process_runner=` provides the same optional workflow-owned execution boundary
 for every required and optional smoke subprocess.
 
