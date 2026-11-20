@@ -40,6 +40,7 @@ from assay import (
     ReviewCoverage,
     ReviewDecision,
     Spec,
+    StaleConversation,
     TierDAG,
     TransportError,
     Usage,
@@ -4061,6 +4062,37 @@ def test_plan_never_retries_terminal_backend_stop(
     assert outcome.cost_usd == pytest.approx(0.01)
     assert len(planner_backend.invocations) == 1
     assert len(critic_backend.invocations) == 0
+
+
+def test_planner_backend_error_status_is_one_rule():
+    """One rule names a planning attempt that ended on a typed backend error.
+
+    A retriable error that is not a cancellation is a lost call; every other
+    error ends planning at once under its own status. A caller that joins
+    several independent attempts applies the same rule to each of them.
+    """
+    from assay.primitives.plan import _planner_backend_error_status
+
+    cases = [
+        (TransportError(message="reset"), "planner_infrastructure_failure"),
+        (
+            TransportError(message="refused", retriable=False),
+            "planner_protocol_failure",
+        ),
+        (BudgetExhausted(spent_usd=0.01, limit_usd=0.01), "budget_exhausted"),
+        (ExternalCancellation(message="cancelled"), "cancelled"),
+        (ContentRejected(message="denied"), "hard_fail_content_rejected"),
+        (MaxTurnsExceeded(message="turn cap"), "hard_fail_max_turns"),
+        (
+            IncompleteEvidence(missing=("terminal_complete",)),
+            "planner_protocol_failure",
+        ),
+        (StaleConversation(message="unknown handle"), "planner_protocol_failure"),
+    ]
+
+    assert [_planner_backend_error_status(error) for error, _ in cases] == [
+        status for _, status in cases
+    ]
 
 
 def test_plan_requires_independent_backends_and_mandatory_judge(tmp_path: Path):
