@@ -2095,6 +2095,24 @@ def _now_execution_context() -> "ExecutionContext":
     )
 
 
+def _planner_backend_error_status(error: object) -> str:
+    """Status of a planning attempt that ended on this typed backend error.
+
+    A retriable error that is not a cancellation is a lost call. Every other
+    error is a workflow terminal under its own status.
+    """
+
+    kind = getattr(error, "kind", "protocol")
+    if getattr(error, "retriable", False) and kind != "cancellation":
+        return "planner_infrastructure_failure"
+    return {
+        "budget_exhausted": "budget_exhausted",
+        "cancellation": "cancelled",
+        "content_rejected": "hard_fail_content_rejected",
+        "max_turns": "hard_fail_max_turns",
+    }.get(kind, "planner_protocol_failure")
+
+
 def plan(
     spec: "Spec",
     *,
@@ -2421,17 +2439,6 @@ def plan(
             **kwargs,
         )
 
-    def planner_error_status(error: object) -> str:
-        """Map one non-retriable backend terminal to workflow semantics."""
-
-        kind = getattr(error, "kind", "protocol")
-        return {
-            "budget_exhausted": "budget_exhausted",
-            "cancellation": "cancelled",
-            "content_rejected": "hard_fail_content_rejected",
-            "max_turns": "hard_fail_max_turns",
-        }.get(kind, "planner_protocol_failure")
-
     def accounting_hold(candidate: TierDAG | None, round_index: int) -> PlanOutcome:
         return finish(
             new_spec, candidate_dag=candidate, decision="inconclusive",
@@ -2655,7 +2662,7 @@ def plan(
                 return accounting_hold(dag, r)
         if dag is None and planner_error is not None:
             if not planner_error.retriable or planner_error.kind == "cancellation":
-                status = planner_error_status(planner_error)
+                status = _planner_backend_error_status(planner_error)
                 logger.error(
                     "planner round %d backend error (%s) is workflow-terminal; "
                     "terminating before another paid planning call",
@@ -3726,7 +3733,7 @@ def plan(
                 _stamp_inflation_if_any(new_spec, inflation, corpus),
                 candidate_dag=last_bounded_dag or last_dag,
                 decision="inconclusive",
-                status="planner_infrastructure_failure",
+                status=_planner_backend_error_status(last_planner_backend_error),
                 rounds_used=attempts_used,
                 final_critic_decision=None,
                 final_judge_decision=None,
