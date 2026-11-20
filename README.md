@@ -500,7 +500,8 @@ safe for concurrent synchronous `invoke()` calls.
 
 - Rust: `cargo check --workspace`, or `cargo check -p <crate>`, with optional
   features from `runner_parameters`;
-- Python: `compileall`, followed by Ruff F-rules when Ruff is available;
+- Python: `compileall` in an isolated interpreter without `site` (`-I -S`),
+  followed by Ruff F-rules when Ruff is available;
 - `.cpp`, `.cc`, `.cxx`, `.h`, `.hpp`, or `.cu`: an explicit pass-through
   because no generic cheap parser is configured;
 - no recognized files: pass with `language=None`.
@@ -509,6 +510,9 @@ Other suffixes, including `.c`, `.cuh`, and `.hxx`, currently follow the
 unrecognized-file path and therefore return `language=None`.
 
 Subprocess failures and timeouts are represented in the returned `SmokeResult`.
+`infrastructure_failure` is true when the failed check produced no verdict on
+the code: a missing required tool, a timeout, or an exit without the tool's
+verdict status.
 The result is not persisted automatically.
 An optional `process_runner` applies one workflow-owned execution boundary to
 all smoke subprocesses; standalone calls retain the standard-library default.
@@ -689,6 +693,16 @@ parsed candidate is checked for same-tier write-scope conflicts, authoritative
 requirement references, configured tier/slice/empty-scope bounds, and the
 validity of any optional `candidate_transform` result.
 
+Generated scope paths are canonicalized against the explicit `project_root=`
+directory, never the process working directory. A leading
+`<submodule_path or project>/` segment is removed unless that existing absolute
+directory holds a directory of the same name; it is then kept on every path,
+existing or new. A `files_in_scope` entry that only repeats the name is left
+for the consumer's candidate validator to report; a `creates_paths` entry
+cannot be told apart from a new file below that directory and is kept as
+written. Without `project_root` the segment is always removed. An invalid root
+raises before any backend call.
+
 Directives may carry typed `read_only_references` to existing source or tests:
 stable `reference_id`, project-relative normalized POSIX `path`, whole-file
 `sha256:<64 lowercase hex>` and inclusive `start_line`/`end_line`. These records
@@ -714,11 +728,17 @@ The response schema helps capable backends produce valid identifiers and
 directive shapes, but the parser remains tolerant enough that a workflow must
 not treat schema advertisement alone as validation.
 
-The parser cleanly treats non-JSON and many incomplete objects as failed plan
-attempts, but some structurally wrong nested JSON values can currently raise
-ordinary `AttributeError` or `ValueError`. Backend response schemas are defense
-in depth; callers must still contain unexpected planner exceptions at the
-workflow boundary.
+The parser treats non-JSON, incomplete objects, and parseable JSON of the wrong
+shape as failed plan attempts that are fed back to the Planner: a slice, or a
+non-empty directive or `blast_radius`, that is not an object; a non-empty list
+field that is not an array (a bare string is never split into characters); an
+object or array where a path, tier dependency, or requirement reference is
+expected; text that cannot be encoded as UTF-8; and nesting or integer literals
+beyond the interpreter's limits. Identifiers, `intent`, `verify_mode`, and
+scalar array members are still coerced with `str()`, and nesting depth has no
+explicit bound of its own.
+Backend response schemas are defense in depth; callers must still contain
+backend exceptions and other unexpected failures at the workflow boundary.
 
 `PlanPolicy` controls critique depth, judge routing, persistent-finding veto,
 weighted judge veto, cumulative plan-inflation limits, optional total tier and
@@ -740,6 +760,13 @@ model-backed calls in protocol order. In fixed-candidate mode that ledger
 contains only Critic and Judge work. Pricing evidence is complete only when
 every call supplies complete physical segments that exactly reconcile the
 inclusive aggregate usage.
+
+A retriable Planner backend error costs the attempt it occurred in. When the
+round budget ends on such an attempt the outcome is `inconclusive` with status
+`planner_infrastructure_failure`, never `no_candidate` or `rounds_exhausted`.
+When a later attempt still received a Planner reply the ordinary status
+stands; only the reasons of `rounds_exhausted` and `no_candidate` count the
+lost attempts.
 
 ## Backends, invocations, and tools
 

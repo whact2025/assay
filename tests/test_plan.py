@@ -13,6 +13,7 @@ import dataclasses
 import copy
 import hashlib
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -39,7 +40,9 @@ from assay import (
     ReviewCoverage,
     ReviewDecision,
     Spec,
+    StaleConversation,
     TierDAG,
+    TransportError,
     Usage,
     UsagePricingEvidence,
     UsagePricingSegment,
@@ -66,6 +69,7 @@ from assay.primitives.plan import (
     _serialize_tier_dag,
     _tier_dag_response_schema,
     _update_persistence,
+    _validated_project_root,
     plan,
 )
 from assay.primitives.review import review as assay_review
@@ -847,6 +851,318 @@ def test_parse_tier_dag_handles_minimal_slice():
     assert dag.tiers[0].slices[0].directive.verify_mode == "tests"  # default
 
 
+_WRONG_SHAPE_MUTATIONS = (
+    "payload_is_a_list",
+    "slices_is_a_string",
+    "slices_is_an_object",
+    "slice_is_a_string",
+    "directive_is_prose",
+    "directive_is_a_list",
+    "blast_radius_is_a_string",
+    "blast_radius_is_a_list",
+    "blast_radius_is_a_pair_list",
+    "files_in_scope_is_a_string",
+    "files_in_scope_is_an_object",
+    "creates_paths_is_a_string",
+    "requirement_refs_is_a_string",
+    "depends_on_is_a_string",
+    "depends_on_is_an_object",
+    "files_in_scope_member_is_a_list",
+    "creates_paths_member_is_an_object",
+    "requirement_refs_member_is_an_object",
+    "depends_on_member_is_a_list",
+    "string_member_is_not_utf8_encodable",
+    "blast_radius_is_nested_beyond_the_recursion_limit",
+)
+
+
+def _wrong_shape_payload(mutation: str):
+    """Return ``_DAG_OK`` with one parseable but structurally wrong value."""
+
+    payload = copy.deepcopy(_DAG_OK)
+    tier = payload["tiers"][0]
+    slice_raw = tier["slices"][0]
+    directive = slice_raw["directive"]
+    if mutation == "payload_is_a_list":
+        return [payload]
+    if mutation == "slices_is_a_string":
+        tier["slices"] = "s0"
+    elif mutation == "slices_is_an_object":
+        tier["slices"] = {"id": "s0"}
+    elif mutation == "slice_is_a_string":
+        tier["slices"] = ["oops"]
+    elif mutation == "directive_is_prose":
+        slice_raw["directive"] = "do it"
+    elif mutation == "directive_is_a_list":
+        slice_raw["directive"] = ["x"]
+    elif mutation == "blast_radius_is_a_string":
+        directive["blast_radius"] = "small"
+    elif mutation == "blast_radius_is_a_list":
+        directive["blast_radius"] = ["src"]
+    elif mutation == "blast_radius_is_a_pair_list":
+        directive["blast_radius"] = [["max_files", 1]]
+    elif mutation == "files_in_scope_is_a_string":
+        directive["files_in_scope"] = "src/a.py"
+    elif mutation == "files_in_scope_is_an_object":
+        directive["files_in_scope"] = {"a": 1}
+    elif mutation == "creates_paths_is_a_string":
+        directive["creates_paths"] = "src/new.py"
+    elif mutation == "requirement_refs_is_a_string":
+        directive["requirement_refs"] = "do"
+    elif mutation == "depends_on_is_a_string":
+        tier["depends_on"] = "t0"
+    elif mutation == "depends_on_is_an_object":
+        tier["depends_on"] = {"t0": 1}
+    elif mutation == "files_in_scope_member_is_a_list":
+        directive["files_in_scope"] = [["src/thing.py"]]
+    elif mutation == "creates_paths_member_is_an_object":
+        directive["creates_paths"] = [{"path": "src/new.py"}]
+    elif mutation == "requirement_refs_member_is_an_object":
+        directive["requirement_refs"] = [{"text": "do the thing"}]
+    elif mutation == "depends_on_member_is_a_list":
+        tier["depends_on"] = [["t0"]]
+    elif mutation == "string_member_is_not_utf8_encodable":
+        # What ``json.loads`` yields for the pure-ASCII escape ``\ud800``.
+        directive["intent"] = "lone surrogate \ud800"
+    elif mutation == "blast_radius_is_nested_beyond_the_recursion_limit":
+        nested: dict = {"leaf": 1}
+        for _ in range(sys.getrecursionlimit() * 5):
+            nested = {"n": nested}
+        directive["blast_radius"] = {"max_files": 1, "deep": nested}
+    else:  # pragma: no cover - guards the parametrisation itself
+        raise AssertionError(mutation)
+    return payload
+
+
+@pytest.mark.parametrize("mutation", _WRONG_SHAPE_MUTATIONS)
+def test_planner_wrong_shape_parse_is_closed(mutation):
+    """Parseable JSON of the wrong shape is no candidate and never raises.
+
+    A bare string must not be split into characters, an object must not be
+    read as its keys, a container must not be stringified into a path or id,
+    and a value that cannot be persisted as UTF-8 must not reach review.
+    """
+
+    assert _parse_tier_dag(_wrong_shape_payload(mutation)) is None
+
+
+def test_parse_tier_dag_keeps_absent_and_null_lists_empty():
+    """The lenient defaults for absent, null and empty list fields stay."""
+
+    payload = copy.deepcopy(_DAG_OK)
+    tier = payload["tiers"][0]
+    directive = tier["slices"][0]["directive"]
+    tier["depends_on"] = None
+    directive["files_in_scope"] = None
+    directive["creates_paths"] = None
+    directive["requirement_refs"] = None
+    directive["blast_radius"] = None
+
+    dag = _parse_tier_dag(payload)
+
+    assert dag is not None
+    assert dag.tiers[0].depends_on == ()
+    parsed = dag.tiers[0].slices[0].directive
+    assert parsed.files_in_scope == ()
+    assert parsed.creates_paths == ()
+    assert parsed.requirement_refs == ()
+    assert parsed.blast_radius == {}
+    del tier["depends_on"]
+    del directive["files_in_scope"]
+    assert _parse_tier_dag(payload) == dag
+
+
+@pytest.mark.parametrize(
+    ("field", "falsy", "empty"),
+    [
+        ("slices", 0, []),
+        ("files_in_scope", "", []),
+        ("directive", [], {}),
+    ],
+    ids=[
+        "slices_is_zero",
+        "files_in_scope_is_an_empty_string",
+        "directive_is_an_empty_list",
+    ],
+)
+def test_parse_tier_dag_reads_a_falsy_value_of_the_wrong_type_as_empty(
+    field, falsy, empty
+):
+    """Pins today's leniency: a falsy value of the wrong type reads as empty.
+
+    ``"slices": 0`` and ``"files_in_scope": ""`` parse like ``[]`` and
+    ``"directive": []`` parses like ``{}``; only a non-empty value of the
+    wrong type is a failed attempt. The stricter parser, which would accept
+    only an absent field, ``null`` and the empty value of the right type, is
+    an open decision.
+    """
+
+    def parsed_with(value):
+        payload = copy.deepcopy(_DAG_OK)
+        tier = payload["tiers"][0]
+        if field == "slices":
+            tier["slices"] = value
+        elif field == "directive":
+            tier["slices"][0]["directive"] = value
+        else:
+            tier["slices"][0]["directive"][field] = value
+        return _parse_tier_dag(payload)
+
+    dag = parsed_with(falsy)
+
+    assert dag is not None
+    assert dag == parsed_with(empty)
+    if field == "slices":
+        assert dag.tiers[0].slices == ()
+    else:
+        assert dag.tiers[0].slices[0].directive.files_in_scope == ()
+
+
+def test_parse_tier_dag_still_coerces_scalar_members_to_text():
+    """Scalar ids and list members keep their ``str()`` coercion."""
+
+    payload = copy.deepcopy(_DAG_OK)
+    tier = payload["tiers"][0]
+    tier["tier_id"] = 0
+    payload["tiers"].append({"tier_id": 1, "depends_on": [0], "slices": []})
+
+    dag = _parse_tier_dag(payload)
+
+    assert dag is not None
+    assert [parsed.tier_id for parsed in dag.tiers] == ["0", "1"]
+    assert dag.tiers[1].depends_on == ("0",)
+
+
+_SINGLE_ROUND_RETRY_POLICY = PlanPolicy(
+    max_critique_rounds=1,
+    judge_required=False,
+    breaker_required=False,
+    persistence_veto_threshold=10,
+)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["slice_is_a_string", "string_member_is_not_utf8_encodable"],
+)
+def test_plan_feeds_wrong_shape_planner_reply_back_as_parse_failure(
+    tmp_path: Path,
+    mutation: str,
+):
+    """A wrong-shape reply costs one attempt; it never escapes ``plan()``."""
+
+    bad_reply = json.dumps(_wrong_shape_payload(mutation))
+    assert bad_reply.isascii()
+    outcome, planner_backend, critic_backend, _ = _plan_with_scripts(
+        _make_spec(),
+        Corpus(tmp_path),
+        planner=[bad_reply, json.dumps(_DAG_OK)],
+        critic=[_VERDICT_PASS],
+        policy=_SINGLE_ROUND_RETRY_POLICY,
+    )
+
+    assert outcome.decision == "accepted"
+    assert outcome.spec.tier_dag == _parse_tier_dag(_DAG_OK)
+    assert len(planner_backend.invocations) == 2
+    assert len(critic_backend.invocations) == 1
+    feedback = planner_backend.invocations[1].user
+    assert "planner_parse_failure" in feedback
+    assert "did not match the TierDAG schema" in feedback
+    assert outcome.cost_usd == pytest.approx(0.03)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "nesting_beyond_the_recursion_limit",
+        "blast_radius_nested_beyond_the_recursion_limit",
+        "blast_radius_nested_beyond_the_parser_but_loadable",
+        "integer_beyond_the_digit_limit",
+    ],
+)
+def test_plan_feeds_unloadable_planner_json_back_as_parse_failure(
+    tmp_path: Path,
+    case: str,
+):
+    """``json.loads`` failures that are not ``JSONDecodeError`` stay contained.
+
+    So does a reply that ``json.loads`` accepts and the parser cannot walk.
+    The ``..._but_loadable`` case nests ``blast_radius`` less deeply than the
+    case before it, so that the parser inside ``plan()`` is what rejects the
+    reply; it is skipped on an interpreter whose ``json.loads`` rejects that
+    nesting as well.
+    """
+
+    depth = sys.getrecursionlimit() * 100
+    if case == "nesting_beyond_the_recursion_limit":
+        bad_reply = '{"tiers": ' + "[" * depth + "]" * depth + "}"
+    elif case in (
+        "blast_radius_nested_beyond_the_recursion_limit",
+        "blast_radius_nested_beyond_the_parser_but_loadable",
+    ):
+        loadable = case == "blast_radius_nested_beyond_the_parser_but_loadable"
+        if loadable:
+            depth = sys.getrecursionlimit() * 5
+        marker = '"blast_radius": {'
+        bad_reply = json.dumps(_DAG_OK)
+        assert marker in bad_reply
+        bad_reply = bad_reply.replace(
+            marker,
+            marker + '"deep": ' + '{"n": ' * depth + "1" + "}" * depth + ", ",
+        )
+        if loadable:
+            try:
+                json.loads(bad_reply)
+            except RecursionError:
+                pytest.skip(
+                    "json.loads of this interpreter rejects this nesting"
+                )
+    else:
+        digit_limit = getattr(sys, "get_int_max_str_digits", lambda: 0)()
+        if not digit_limit:
+            pytest.skip("this interpreter does not limit integer literals")
+        bad_reply = json.dumps(_DAG_OK).replace(
+            '"tier_id": "t0"', '"tier_id": ' + "1" * (digit_limit + 1)
+        )
+        assert bad_reply != json.dumps(_DAG_OK)
+    outcome, planner_backend, critic_backend, _ = _plan_with_scripts(
+        _make_spec(),
+        Corpus(tmp_path),
+        planner=[bad_reply, json.dumps(_DAG_OK)],
+        critic=[_VERDICT_PASS],
+        policy=_SINGLE_ROUND_RETRY_POLICY,
+    )
+
+    assert outcome.decision == "accepted"
+    assert outcome.spec.tier_dag == _parse_tier_dag(_DAG_OK)
+    assert len(planner_backend.invocations) == 2
+    assert len(critic_backend.invocations) == 1
+    assert "planner_parse_failure" in planner_backend.invocations[1].user
+
+
+def test_plan_never_reviews_a_bare_string_scope_split_into_characters(
+    tmp_path: Path,
+):
+    bare_string_scope = copy.deepcopy(_DAG_OK)
+    bare_string_scope["tiers"][0]["slices"][0]["directive"]["files_in_scope"] = (
+        "src/thing.py"
+    )
+    outcome, planner_backend, critic_backend, _ = _plan_with_scripts(
+        _make_spec(),
+        Corpus(tmp_path),
+        planner=[json.dumps(bare_string_scope), json.dumps(_DAG_OK)],
+        critic=[_VERDICT_PASS],
+        policy=_SINGLE_ROUND_RETRY_POLICY,
+    )
+
+    assert outcome.decision == "accepted"
+    assert outcome.spec.tier_dag is not None
+    directive = outcome.spec.tier_dag.tiers[0].slices[0].directive
+    assert directive.files_in_scope == ("src/thing.py",)
+    assert len(planner_backend.invocations) == 2
+    assert len(critic_backend.invocations) == 1
+
+
 # ----------------------------------------------------------------------
 # _canonicalize_scope_path — strip a workspace/project-name prefix so the
 # planner's paths are project-root-relative (the cwd the build runs from).
@@ -873,7 +1189,7 @@ def test_canonicalize_keeps_real_nested_dir_prefix(tmp_path):
     # Doubled kit/kit layout: the submodule root `kit/` holds an inner `kit/`.
     # `kit/source/foo.cpp` is a REAL path (resolves to <base>/kit/source/foo.cpp);
     # stripping the `kit/` prefix would point downstream rules at a nonexistent
-    # `source/foo.cpp`. With base_dir given and the unstripped path on disk, keep it.
+    # `source/foo.cpp`. With base_dir given and the inner `kit/` on disk, keep it.
     base = tmp_path / "kit"  # project root = <workspace>/<submodule>
     (base / "kit" / "source").mkdir(parents=True)
     (base / "kit" / "source" / "foo.cpp").write_text("x")
@@ -883,14 +1199,44 @@ def test_canonicalize_keeps_real_nested_dir_prefix(tmp_path):
     )
 
 
-def test_canonicalize_strips_when_unstripped_absent_even_with_base(tmp_path):
-    # fabric-usd case: <base>/fabric-usd/crates does not exist (only crates/ does),
+@pytest.mark.parametrize(
+    "path",
+    [
+        "kit/source/new.cpp",  # a new file beside an existing one
+        "kit/fresh/new.cpp",  # a new file in a new directory
+        "kit/rendering/bar.cpp",  # exists only as <base>/rendering/bar.cpp
+    ],
+)
+def test_canonicalize_keeps_every_path_under_real_nested_dir(tmp_path, path):
+    # The same-named directory is real, so the segment is part of a
+    # project-root-relative path whether or not the file exists yet. A path
+    # that only repeats the project name is not guessed at and rewritten here.
+    base = tmp_path / "kit"
+    (base / "kit" / "source").mkdir(parents=True)
+    (base / "rendering").mkdir()
+    (base / "rendering" / "bar.cpp").write_text("x")
+    assert _canonicalize_scope_path(path, "kit", str(base)) == path
+
+
+def test_canonicalize_strips_when_base_has_no_same_named_dir(tmp_path):
+    # fabric-usd case: <base>/fabric-usd does not exist (only crates/ does),
     # so the leading prefix IS a redundant project-name prefix — strip it.
     base = tmp_path / "fabric-usd"
     (base / "crates").mkdir(parents=True)
     assert (
         _canonicalize_scope_path("fabric-usd/crates/foo.rs", "fabric-usd", str(base))
         == "crates/foo.rs"
+    )
+
+
+def test_canonicalize_strips_when_same_named_entry_is_a_regular_file(tmp_path):
+    # Nothing can live below a regular file, so the prefix repeats the name.
+    base = tmp_path / "kit"
+    base.mkdir()
+    (base / "kit").write_text("x")
+    assert (
+        _canonicalize_scope_path("kit/source/foo.cpp", "kit", str(base))
+        == "source/foo.cpp"
     )
 
 
@@ -941,6 +1287,227 @@ def test_parse_tier_dag_canonicalizes_scope_paths():
     d = dag.tiers[0].slices[0].directive
     assert d.files_in_scope == ("crates/a.rs",)
     assert d.creates_paths == ("crates/b.rs",)
+
+
+def _same_named_nested_project(tmp_path: Path) -> tuple[Spec, Path, Path]:
+    """Return ``(spec, workspace, project_root)`` for a doubled ``kit/kit`` tree.
+
+    The project root is ``<workspace>/kit``. It holds a real nested ``kit``
+    directory, so every ``kit/...`` path is project-relative as written.
+    ``rendering/bar.cpp`` exists only directly below the project root.
+    """
+
+    workspace = tmp_path / "ws"
+    project_root = workspace / "kit"
+    (project_root / "kit" / "source").mkdir(parents=True)
+    (project_root / "kit" / "source" / "foo.cpp").write_text("x")
+    (project_root / "rendering").mkdir()
+    (project_root / "rendering" / "bar.cpp").write_text("x")
+    base = _make_spec()
+    spec = dataclasses.replace(
+        base,
+        project_context=dataclasses.replace(
+            base.project_context, project="kit", submodule_path="kit"
+        ),
+    )
+    return spec, workspace, project_root
+
+
+def _plan_scope_paths(
+    spec: Spec,
+    corpus_root: Path,
+    *,
+    files_in_scope: list[str],
+    creates_paths: list[str] | None = None,
+    **plan_kwargs,
+):
+    """Plan one accepted round whose planner reply carries the given scopes."""
+
+    payload = copy.deepcopy(_DAG_OK)
+    directive = payload["tiers"][0]["slices"][0]["directive"]
+    directive["files_in_scope"] = files_in_scope
+    directive["creates_paths"] = creates_paths or []
+    planner_backend = ScriptedBackend([json.dumps(payload)])
+    critic_backend = ScriptedBackend([_VERDICT_PASS])
+    outcome = plan(
+        spec,
+        planner_backend=planner_backend,
+        critic_backend=critic_backend,
+        judge_backend=None,
+        corpus=Corpus(corpus_root),
+        critic_rubric=_rubric("critic"),
+        policy=PlanPolicy(
+            max_critique_rounds=0,
+            judge_required=False,
+            breaker_required=False,
+            persistence_veto_threshold=10,
+        ),
+        **plan_kwargs,
+    )
+    return outcome, planner_backend, critic_backend
+
+
+@pytest.mark.parametrize("root_type", [str, Path])
+def test_plan_canonicalizes_scope_against_project_root_from_any_process_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    root_type,
+):
+    """A real same-named directory keeps the segment on every scope path.
+
+    The existing file, the new file beside it, and the new file in a new
+    directory stay together below ``kit/``. ``kit/rendering/bar.cpp`` names
+    nothing (the file is ``rendering/bar.cpp``); it is kept as written so the
+    consumer's deterministic scope gate reports it, never silently rewritten.
+    """
+
+    spec, _, project_root = _same_named_nested_project(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    outcome, _, _ = _plan_scope_paths(
+        spec,
+        tmp_path / "corpus",
+        files_in_scope=["kit/source/foo.cpp", "kit/rendering/bar.cpp"],
+        creates_paths=["kit/source/new.cpp", "kit/fresh/new.cpp"],
+        project_root=root_type(project_root),
+    )
+
+    assert outcome.decision == "accepted"
+    assert outcome.spec.tier_dag is not None
+    directive = outcome.spec.tier_dag.tiers[0].slices[0].directive
+    assert directive.files_in_scope == (
+        "kit/source/foo.cpp",
+        "kit/rendering/bar.cpp",
+    )
+    assert directive.creates_paths == ("kit/source/new.cpp", "kit/fresh/new.cpp")
+
+
+def test_plan_strips_repeated_project_name_when_project_root_has_no_such_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Without a same-named directory the segment can only repeat the name."""
+
+    spec, workspace, _ = _same_named_nested_project(tmp_path)
+    flat_root = tmp_path / "flat" / "kit"
+    (flat_root / "rendering").mkdir(parents=True)
+    (flat_root / "rendering" / "bar.cpp").write_text("x")
+    # The process cwd holds ``kit/kit``; only the explicit root decides.
+    monkeypatch.chdir(workspace)
+
+    outcome, _, _ = _plan_scope_paths(
+        spec,
+        tmp_path / "corpus",
+        files_in_scope=["kit/rendering/bar.cpp"],
+        creates_paths=["kit/rendering/new.cpp"],
+        project_root=flat_root,
+    )
+
+    assert outcome.decision == "accepted"
+    assert outcome.spec.tier_dag is not None
+    directive = outcome.spec.tier_dag.tiers[0].slices[0].directive
+    assert directive.files_in_scope == ("rendering/bar.cpp",)
+    assert directive.creates_paths == ("rendering/new.cpp",)
+
+
+@pytest.mark.parametrize("process_cwd", ["workspace", "project_root"])
+def test_plan_without_project_root_never_probes_the_process_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process_cwd: str,
+):
+    """Without a root there is no proof, whatever the process cwd holds.
+
+    Each natural cwd fallback would keep the segment from one of these
+    directories: a ``<cwd>/<prefix>`` base finds ``kit/kit`` from the
+    workspace, a plain ``os.getcwd()`` base finds it from the project root.
+    """
+
+    spec, workspace, project_root = _same_named_nested_project(tmp_path)
+    monkeypatch.chdir(
+        {"workspace": workspace, "project_root": project_root}[process_cwd]
+    )
+
+    outcome, _, _ = _plan_scope_paths(
+        spec,
+        tmp_path / "corpus",
+        files_in_scope=["kit/source/foo.cpp"],
+        creates_paths=["kit/source/new.cpp"],
+    )
+
+    assert outcome.decision == "accepted"
+    assert outcome.spec.tier_dag is not None
+    directive = outcome.spec.tier_dag.tiers[0].slices[0].directive
+    assert directive.files_in_scope == ("source/foo.cpp",)
+    assert directive.creates_paths == ("source/new.cpp",)
+
+
+@pytest.mark.parametrize(
+    ("case", "error"),
+    [
+        ("relative", ValueError),
+        ("empty", ValueError),
+        ("regular_file", ValueError),
+        ("missing", ValueError),
+        ("not_a_path", TypeError),
+        ("bytes_path", TypeError),
+    ],
+)
+def test_plan_rejects_invalid_project_root_before_any_backend_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    error: type[Exception],
+):
+    spec, workspace, project_root = _same_named_nested_project(tmp_path)
+    # A relative root would silently resolve against this directory.
+    monkeypatch.chdir(workspace)
+    root: object = {
+        "relative": "kit",
+        "empty": "",
+        "regular_file": str(project_root / "rendering" / "bar.cpp"),
+        "missing": str(tmp_path / "missing"),
+        "not_a_path": 3,
+        "bytes_path": bytes(project_root),
+    }[case]
+    planner_backend = ScriptedBackend([json.dumps(_DAG_OK)])
+    critic_backend = ScriptedBackend([_VERDICT_PASS])
+
+    with pytest.raises(error, match="project_root "):
+        plan(
+            spec,
+            planner_backend=planner_backend,
+            critic_backend=critic_backend,
+            judge_backend=None,
+            corpus=Corpus(tmp_path / "corpus"),
+            critic_rubric=_rubric("critic"),
+            policy=PlanPolicy(max_critique_rounds=0, judge_required=False),
+            project_root=root,
+        )
+
+    assert planner_backend.invocations == []
+    assert critic_backend.invocations == []
+
+
+@pytest.mark.parametrize("root_type", [str, Path])
+def test_validated_project_root_returns_the_normpath_of_its_argument(
+    tmp_path: Path,
+    root_type,
+):
+    """Pins today's behaviour: the root is returned through ``normpath``.
+
+    The directory check reads the spelling as given and the
+    ``os.path.normpath`` that follows is lexical. Dropping ``normpath``, so
+    that the returned root is the validated spelling, is an open decision.
+    """
+
+    _, _, project_root = _same_named_nested_project(tmp_path)
+    spelling = root_type(project_root / "kit" / "..")
+    assert str(spelling).endswith("..")
+
+    assert _validated_project_root(spelling) == str(project_root)
 
 
 # ----------------------------------------------------------------------
@@ -3497,6 +4064,37 @@ def test_plan_never_retries_terminal_backend_stop(
     assert len(critic_backend.invocations) == 0
 
 
+def test_planner_backend_error_status_is_one_rule():
+    """One rule names a planning attempt that ended on a typed backend error.
+
+    A retriable error that is not a cancellation is a lost call; every other
+    error ends planning at once under its own status. A caller that joins
+    several independent attempts applies the same rule to each of them.
+    """
+    from assay.primitives.plan import _planner_backend_error_status
+
+    cases = [
+        (TransportError(message="reset"), "planner_infrastructure_failure"),
+        (
+            TransportError(message="refused", retriable=False),
+            "planner_protocol_failure",
+        ),
+        (BudgetExhausted(spent_usd=0.01, limit_usd=0.01), "budget_exhausted"),
+        (ExternalCancellation(message="cancelled"), "cancelled"),
+        (ContentRejected(message="denied"), "hard_fail_content_rejected"),
+        (MaxTurnsExceeded(message="turn cap"), "hard_fail_max_turns"),
+        (
+            IncompleteEvidence(missing=("terminal_complete",)),
+            "planner_protocol_failure",
+        ),
+        (StaleConversation(message="unknown handle"), "planner_protocol_failure"),
+    ]
+
+    assert [_planner_backend_error_status(error) for error, _ in cases] == [
+        status for _, status in cases
+    ]
+
+
 def test_plan_requires_independent_backends_and_mandatory_judge(tmp_path: Path):
     corpus = Corpus(tmp_path)
     shared = ScriptedBackend([])
@@ -3901,6 +4499,84 @@ def test_plan_no_inflation_when_round_zero_only(tmp_path: Path):
     assert len(outcome.spec.verdict_refs) == 1
 
 
+def _staged_verdicts(corpus: Corpus, outcome) -> list[Verdict]:
+    return [
+        corpus.get_record(ref, as_type=Verdict)
+        for ref in outcome.spec.verdict_refs
+    ]
+
+
+def test_plan_no_inflation_when_first_critic_review_follows_failed_planner_round(
+    tmp_path: Path,
+):
+    """The attempt index also counts attempts that never reached the Critic."""
+    corpus = Corpus(tmp_path)
+    outcome, planner_backend, critic_backend, _ = _plan_with_scripts(
+        _make_spec(), corpus,
+        planner=["not json", json.dumps(_DAG_OK)],
+        critic=[_verdict_fail_with_ids("f1", "f2")],
+        policy=PlanPolicy(
+            max_critique_rounds=1,
+            judge_required=False,
+            breaker_required=False,
+            persistence_veto_threshold=10,
+        ),
+    )
+
+    assert len(planner_backend.invocations) == 2
+    assert len(critic_backend.invocations) == 1
+    assert [v.kind for v in _staged_verdicts(corpus, outcome)] == ["critic"]
+
+
+def test_plan_inflation_counts_only_findings_added_after_first_critic_review(
+    tmp_path: Path,
+):
+    corpus = Corpus(tmp_path)
+    outcome, *_ = _plan_with_scripts(
+        _make_spec(), corpus,
+        planner=["not json", json.dumps(_DAG_OK), json.dumps(_DAG_OK)],
+        critic=[
+            _verdict_fail_with_ids("f1"),
+            _verdict_fail_with_ids("f1", "f2"),
+        ],
+        policy=PlanPolicy(
+            max_critique_rounds=2,
+            judge_required=False,
+            breaker_required=False,
+            persistence_veto_threshold=10,
+        ),
+    )
+
+    verdicts = _staged_verdicts(corpus, outcome)
+    assert [v.kind for v in verdicts] == ["critic", "critic", "inflation"]
+    assert [f.evidence[0].excerpt for f in verdicts[-1].findings] == ["f2"]
+
+
+def test_plan_no_inflation_when_first_conclusive_critic_review_follows_inconclusive(
+    tmp_path: Path,
+):
+    """A Critic reply without a verdict is not a prior review of a candidate."""
+    corpus = Corpus(tmp_path)
+    outcome, *_ = _plan_with_scripts(
+        _make_spec(), corpus,
+        planner=[json.dumps(_DAG_OK), json.dumps(_DAG_OK)],
+        critic=[_INVALID_REVIEW, _verdict_fail_with_ids("f1", "f2")],
+        policy=PlanPolicy(
+            max_critique_rounds=1,
+            judge_required=False,
+            breaker_required=False,
+            persistence_veto_threshold=10,
+            max_critic_failures=3,
+        ),
+    )
+
+    verdicts = _staged_verdicts(corpus, outcome)
+    assert [(v.kind, v.decision) for v in verdicts] == [
+        ("critic", "inconclusive"),
+        ("critic", "revise"),
+    ]
+
+
 def test_plan_no_inflation_when_findings_persist(tmp_path: Path):
     """Same finding ids round-over-round → no inflation; only persistence."""
     corpus = Corpus(tmp_path)
@@ -3965,6 +4641,41 @@ def test_plan_inflation_when_revision_adds_new_id(tmp_path: Path):
     )
     # 2 critic + 1 synthetic inflation Verdict = 3 refs.
     assert len(outcome.spec.verdict_refs) == 3
+
+
+def test_plan_inflation_when_first_critic_review_had_no_active_finding(
+    tmp_path: Path,
+):
+    """An earlier Critic verdict arms the guard, not an earlier finding.
+
+    The Critic passes the first candidate without a finding and the Judge
+    asks for a revision. The finding the Critic then adds on the revised
+    candidate is stamped, although no Critic finding was seen before it.
+    """
+    corpus = Corpus(tmp_path)
+    judge_revise = _review_response("revise", [_review_finding("j1")])
+    outcome, *_ = _plan_with_scripts(
+        _make_spec(), corpus,
+        planner=[json.dumps(_DAG_OK), json.dumps(_DAG_OK)],
+        critic=[_VERDICT_PASS, _verdict_fail_with_ids("f1")],
+        judge=[judge_revise, judge_revise],
+        policy=PlanPolicy(
+            max_critique_rounds=1,
+            judge_required=True,
+            breaker_required=False,
+            persistence_veto_threshold=10,
+        ),
+    )
+
+    verdicts = _staged_verdicts(corpus, outcome)
+    assert [(v.kind, v.decision) for v in verdicts[:-1]] == [
+        ("critic", "pass"),
+        ("judge", "revise"),
+        ("critic", "revise"),
+        ("judge", "revise"),
+    ]
+    assert verdicts[-1].kind == "inflation"
+    assert [f.evidence[0].excerpt for f in verdicts[-1].findings] == ["f1"]
 
 
 def test_plan_inflation_collects_across_rounds(tmp_path: Path):
@@ -4313,22 +5024,27 @@ def test_empty_scope_gate_rejects_mutation_shaped_filler():
     assert findings[0].id == "empty_scope_filler_2_s0"
 
 
+def _lost_planner_attempt() -> dict:
+    """A planner call whose backend returned a retriable error and no reply."""
+    return {
+        "error": TransportError(
+            http_status=529, message="overloaded", retriable=True
+        ),
+    }
+
+
 def test_plan_backend_error_is_not_treated_as_parse_failure(tmp_path: Path, caplog):
     """APLAN-1: a backend error each round must be logged as a backend
     error (and fed back as such) — NOT as a 'your JSON was invalid'
-    rebuke. The loop retries; with no good DAG it returns unchanged."""
+    rebuke. The loop retries; with every attempt lost the outcome names the
+    planner backend instead of a planner that produced no candidate."""
     import logging
-    from assay import TransportError
 
     corpus = Corpus(tmp_path)
-    planner_responses = [
-        {"error": TransportError(http_status=529, message="overloaded", retriable=True)},
-        {"error": TransportError(http_status=529, message="overloaded", retriable=True)},
-    ]
     with caplog.at_level(logging.WARNING, logger="assay.primitives.plan"):
-        outcome, *_ = _plan_with_scripts(
+        outcome, planner_backend, critic_backend, _ = _plan_with_scripts(
             _make_spec(), corpus,
-            planner=planner_responses,
+            planner=[_lost_planner_attempt(), _lost_planner_attempt()],
             critic=[],
             policy=PlanPolicy(max_critique_rounds=1, judge_required=False,
                               breaker_required=False, persistence_veto_threshold=99),
@@ -4336,6 +5052,147 @@ def test_plan_backend_error_is_not_treated_as_parse_failure(tmp_path: Path, capl
     assert outcome.spec.tier_dag is None
     assert "backend error" in caplog.text
     assert "not valid" not in caplog.text  # NOT the parse-failure rebuke path
+    assert outcome.decision == "inconclusive"
+    assert outcome.status == "planner_infrastructure_failure"
+    assert "final 2 planning attempt(s)" in outcome.reason
+    assert "transport" in outcome.reason
+    assert "overloaded" in outcome.reason
+    assert outcome.candidate_dag is None
+    assert outcome.rounds_used == 2
+    assert len(planner_backend.invocations) == 2
+    assert len(critic_backend.invocations) == 0
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "reviewed_then_lost",
+        "unparseable_then_lost",
+        "lost_then_reviewed_then_lost",
+    ],
+)
+def test_plan_reports_planner_infrastructure_failure_when_final_attempts_are_lost(
+    tmp_path: Path,
+    case: str,
+):
+    """A round budget that ends on a lost planner call did not fail to agree.
+
+    The reason counts the lost calls at the end of the budget, not every lost
+    call: ``lost_then_reviewed_then_lost`` loses two attempts, ends on one of
+    them and names one.
+    """
+    corpus = Corpus(tmp_path)
+    reviewed = case != "unparseable_then_lost"
+    planner: list[str | dict] = [
+        json.dumps(_DAG_OK) if reviewed else "not json",
+        _lost_planner_attempt(),
+    ]
+    if case == "lost_then_reviewed_then_lost":
+        planner.insert(0, _lost_planner_attempt())
+    attempts = len(planner)
+    outcome, planner_backend, critic_backend, _ = _plan_with_scripts(
+        _make_spec(), corpus,
+        planner=planner,
+        critic=[_VERDICT_FAIL] if reviewed else [],
+        policy=PlanPolicy(
+            max_critique_rounds=attempts - 1,
+            judge_required=False,
+            breaker_required=False,
+            persistence_veto_threshold=10,
+        ),
+    )
+
+    assert outcome.decision == "inconclusive"
+    assert outcome.status == "planner_infrastructure_failure"
+    assert "final 1 planning attempt(s)" in outcome.reason
+    assert "transport: overloaded" in outcome.reason
+    assert outcome.rounds_used == attempts
+    assert outcome.spec.tier_dag is None
+    assert outcome.candidate_dag == (
+        _parse_tier_dag(_DAG_OK) if reviewed else None
+    )
+    assert len(planner_backend.invocations) == attempts
+    assert len(critic_backend.invocations) == (1 if reviewed else 0)
+    event = corpus.get_record(
+        outcome.spec.lifecycle_event_refs[-1], as_type=LifecycleEvent
+    )
+    assert event.kind == "plan_inconclusive"
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_status", "expected_reason"),
+    [
+        (
+            "lost_then_unparseable",
+            "no_candidate",
+            "planner produced no safe bounded tier_dag in any round",
+        ),
+        (
+            "lost_then_reviewed",
+            "rounds_exhausted",
+            "max rounds (2) exhausted without consensus",
+        ),
+    ],
+    ids=["lost_then_unparseable", "lost_then_reviewed"],
+)
+def test_plan_backend_loss_before_a_final_planner_reply_keeps_existing_status(
+    tmp_path: Path,
+    case: str,
+    expected_status: str,
+    expected_reason: str,
+):
+    """Only a round budget that ENDS on a lost planner call changes the status.
+
+    A lost call that a later planner reply follows leaves the ordinary status
+    in place. The two statuses of this test, ``no_candidate`` and
+    ``rounds_exhausted``, count the lost attempts in their reason.
+    """
+    reviewed = case == "lost_then_reviewed"
+    outcome, planner_backend, critic_backend, _ = _plan_with_scripts(
+        _make_spec(), Corpus(tmp_path),
+        planner=[
+            _lost_planner_attempt(),
+            json.dumps(_DAG_OK) if reviewed else "not json",
+        ],
+        critic=[_VERDICT_FAIL] if reviewed else [],
+        policy=PlanPolicy(
+            max_critique_rounds=1,
+            judge_required=False,
+            breaker_required=False,
+            persistence_veto_threshold=10,
+        ),
+    )
+
+    assert outcome.decision == "inconclusive"
+    assert outcome.status == expected_status
+    assert expected_reason in outcome.reason
+    assert (
+        "1 planning attempt(s) were lost to retriable planner backend errors "
+        "(last: transport)"
+    ) in outcome.reason
+    assert len(planner_backend.invocations) == 2
+    assert len(critic_backend.invocations) == (1 if reviewed else 0)
+
+
+def test_plan_accepts_after_a_lost_planner_attempt_without_naming_it(
+    tmp_path: Path,
+):
+    outcome, planner_backend, _, _ = _plan_with_scripts(
+        _make_spec(), Corpus(tmp_path),
+        planner=[_lost_planner_attempt(), json.dumps(_DAG_OK)],
+        critic=[_VERDICT_PASS],
+        policy=PlanPolicy(
+            max_critique_rounds=1,
+            judge_required=False,
+            breaker_required=False,
+            persistence_veto_threshold=10,
+        ),
+    )
+
+    assert outcome.decision == "accepted"
+    assert outcome.status == "accepted"
+    assert "lost" not in outcome.reason
+    assert len(planner_backend.invocations) == 2
 
 
 def test_plan_rejects_parallel_tier_conflict_and_replans(tmp_path: Path, caplog):
