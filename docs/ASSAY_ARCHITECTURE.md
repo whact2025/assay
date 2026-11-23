@@ -302,7 +302,7 @@ workflow gate. Consumers still interpret each decision in context.
 | `Implementation` | Slice/base/result commits, diff/transcript refs, modified files, classification, execution, scope escapes, attached artifact refs, cost, tokens, optional ordered pricing evidence, and non-normal stop reason. |
 | `Measurement` | `bench_id`, `commit`, semantic `config_hash`, numeric values, raw-output ref, and execution. |
 | `LifecycleEvent` | Free-form `kind`, `reason`, affected Spec versions, and execution. |
-| `SmokeResult` | `passed`, selected language, bounded log excerpt, and duration in milliseconds. |
+| `SmokeResult` | `passed`, selected language, bounded log excerpt, duration in milliseconds, and `infrastructure_failure` for a failed check that produced no verdict on the code. |
 | `PlanOutcome` | Returned Spec, diagnostic candidate and ref, terminal plan decision/status, round decisions, reason, aggregate inclusive usage, execution completeness, and ordered pricing evidence. |
 
 Plan decisions are `accepted`, `rejected`, and `inconclusive`.
@@ -1152,6 +1152,7 @@ plan(
     budget_usd=None,
     allowed_tools=None,
     prompt_toolset=None,
+    project_root=None,
     candidate_transform=None,
     candidate_validator=None,
     candidate_context_provider=None,
@@ -1174,9 +1175,18 @@ Only two passes install the DAG. Every other result remains diagnostic and a
 revision must arrive in a new invocation.
 
 Each planner invocation advertises a strict TierDAG JSON Schema. Parsed scope
-paths are normalized to the project execution root. A parsed candidate can be
-passed through one caller-supplied `candidate_transform`; an exception or
-non-DAG return ends inconclusively before review.
+paths are normalized to the project execution root: a leading
+`<submodule_path or project>/` segment is removed unless the caller's
+`project_root`, an existing absolute directory, holds a directory of that
+name. The segment is then kept on every path, existing or new, so one
+candidate is never split between kept and stripped spellings; a path that only
+repeats the name is not rewritten. A `files_in_scope` entry that only repeats
+the name is left for the consumer's candidate validator to report; a
+`creates_paths` entry cannot be told apart from a new file below that
+directory and is kept as written. Without `project_root` the segment is always
+removed; the process working directory is never consulted. A parsed candidate
+can be passed through one caller-supplied `candidate_transform`; an exception
+or non-DAG return ends inconclusively before review.
 
 After candidate admission, an optional `candidate_context_provider` captures
 consumer-verified source context once for the Critic/Judge pair. Its immutable
@@ -1219,11 +1229,15 @@ existing bounded source-linkage correction. The corrected candidate must
 pass the unchanged exact-source gate and normal Critic/Judge review; no root
 text is rewritten and no generated feedback becomes requirement authority.
 
-The fallback parser handles non-JSON and many missing structures as a failed
-attempt, but it does not type-check every nested value before dereferencing or
-coercing it. Some structurally invalid planner JSON can therefore propagate
-`AttributeError` or `ValueError` instead of becoming a `PlanOutcome`. A
-workflow must contain unexpected backend/parser exceptions.
+The fallback parser turns non-JSON, missing structures, and parseable JSON of
+the wrong shape into a failed attempt that is fed back to the Planner. A slice,
+or a non-empty directive or `blast_radius`, must be an object and a non-empty
+list field an array; an array member that is itself an object or array, text
+that cannot be encoded as UTF-8, and nesting or integer literals beyond the
+interpreter's limits are rejected the same way. Identifiers, `intent`,
+`verify_mode`, and scalar array members are coerced with `str()`, and nesting
+depth has no explicit bound of its own. A workflow must contain backend
+exceptions and other unexpected failures.
 
 The candidate then receives critic review and, when required, independent judge
 review. Plan tracks full role history, active finding lineages, consecutive
@@ -1269,6 +1283,13 @@ the prior executable DAG unchanged. Every terminal outcome adds a lifecycle
 event (`planned`, `plan_rejected`, or `plan_inconclusive`) and advances the
 returned Spec exactly one version. Review verdict refs accumulated during the
 debate are attached in that same returned version.
+
+A retriable Planner backend error consumes the attempt it occurred in. If the
+round budget ends on such an attempt, the outcome is `inconclusive` with status
+`planner_infrastructure_failure` rather than `no_candidate` or
+`rounds_exhausted`, and a reviewed candidate stays diagnostic. When a later
+attempt received a Planner reply, the ordinary status stands; only the reasons
+of `rounds_exhausted` and `no_candidate` count the lost attempts.
 
 `plan` persists planner/reviewer transcripts, candidate bytes, Verdict records,
 inflation records, and the terminal lifecycle event through the Corpus. It does
@@ -1533,8 +1554,10 @@ Language selection examines declared edit/create paths in this precedence:
 1. any `.rs`: run `cargo check --workspace`, or `cargo check -p <crate>` with
    optional comma-joined features projected from generic runner parameters and
    `per_language.rust`;
-2. otherwise any `.py`: run the current interpreter's `compileall -q`, then
-   `ruff check --select F --no-fix --no-cache` when Ruff is discoverable;
+2. otherwise any `.py`: run the current interpreter's `compileall -q` in
+   isolated mode without `site` (`-I -S`, with a private
+   `-X pycache_prefix`), then `ruff check --select F --no-fix --no-cache`
+   when Ruff is discoverable; both commands receive the paths after `--`;
 3. otherwise `.cpp`, `.cc`, `.cxx`, `.h`, `.hpp`, or `.cu`: explicit
    pass-through with `language="cpp"`;
 4. otherwise: pass-through with `language=None`.
@@ -1550,6 +1573,43 @@ or backend side effect.
 When supplied, `process_runner` owns every subprocess launch through the same
 `subprocess.run`-compatible subset; the default remains the standard library.
 
+`SmokeResult.infrastructure_failure` separates a failed check that could not
+run from a rejection of the code. It is true, with `passed=False`, when a
+required tool is missing, a required command times out, or a tool exits without
+its verdict status. `compileall` and Ruff report findings with exit 1; any
+other nonzero exit is an infrastructure failure, and so is a `compileall`
+exit 1 that names no rejected source (an interpreter that failed to start, or
+only operating-system errors while reading a source or writing the private
+cache). `cargo check` reports a build failure with exit 101; that exit is
+attributed to the code only when the output contains an `error` diagnostic
+that carries a `-->` source span, or a TOML parse error that Cargo reports as
+a cause of its failure to parse the manifest or the lock file, because Cargo
+uses the same status for registry, build-directory lock, permission, and
+killed-compiler failures. The span may follow the further lines of a
+multi-line message. rustc indents those lines; Cargo 1.85.0 prints them in
+the first column for a manifest that is not TOML, so a first-column line
+directly below the `error` header, or below another such line, continues the
+message unless it is a diagnostic header itself or `Caused by:`. A span that
+belongs to a warning, note, or help does not count, and a message line that
+is shaped like a diagnostic header ends the diagnostic. The TOML parse error
+counts only as a `Caused by:` entry of the Cargo error that names the
+manifest or the lock file, and only in the wording
+`TOML parse error at line N`: a Cargo configuration file that is not TOML,
+which may lie outside the checked tree, the same words in a build script's
+output, and a span-less parse error in other words are flagged. Neither rule
+examines whether the named file lies inside the checked tree. Rust parameter
+shape errors are configuration failures and are not flagged. The flag means
+that the check gave no verdict; it does not establish that the environment is
+at fault or that a retry would succeed, because a tool configuration in the
+checked tree that Ruff or Cargo rejects and a Cargo failure that names no
+source location are flagged as well. The isolated interpreter keeps the
+checked tree and every `PYTHON*` variable from replacing the standard-library
+`compileall`; running it without `site` keeps the `.pth` files and any
+`sitecustomize` module of the interpreter's environment out as well, which
+matters when an editable install puts a directory of the checked tree on that
+path. The `--` separator keeps a declared path that looks like an option from
+being read as one.
+
 ---
 
 ## 10. Failure semantics by boundary
@@ -1558,13 +1618,13 @@ When supplied, `process_runner` owns every subprocess launch through the same
 |---|---|---|
 | Canonical/codec | Raises `TypeError`, `ValueError`, or `RecordDecodeError`. | Corrupt persisted data raises; there is no fallback decoding. |
 | Corpus | Invalid lineage, missing/wrong-kind refs, parked Spec, or bad transform raises. | Concurrent version conflict raises `ConcurrentSpecError`; filesystem/SQLite errors propagate. |
-| `plan` | Missing required judge or reused backend objects raise; invalid transforms end inconclusively. | Returned backend errors, ordinary parse failures, policy vetoes, budget exhaustion, and review failures become rejected/inconclusive `PlanOutcome`s. Unchecked backend exceptions and some malformed nested planner values can propagate. |
+| `plan` | Missing required judge, reused backend objects, or an invalid `project_root` raise; invalid transforms end inconclusively. | Returned backend errors, unparseable or wrong-shape planner replies, policy vetoes, budget exhaustion, and review failures become rejected/inconclusive `PlanOutcome`s. Unchecked backend exceptions can propagate; planner nesting depth has no explicit bound. |
 | `review` | Invalid sources, context, template placeholders, or repair-policy wiring raises before/around invocation. | Returned backend errors and invalid model output become inconclusive Verdicts. Unchecked backend/provider exceptions can propagate. |
 | `validate` | Resolver/import, arity, missing context, and return-shape errors raise. | A rule exception becomes a Critical finding; other rules continue. |
 | `implement` | Initial Git HEAD/capture setup can raise `GitCaptureError`; unchecked backend exceptions propagate. | Returned backend errors and post-call capture/scope/no-change conditions become classification strings. |
 | `bench` | Empty runner and invalid runner output raise `BenchRunnerError`. | Timeout/nonzero exit/missing output/nonfinite values raise `BenchRunnerError`. |
 | `sweep` / `parallel` | Invalid collection/worker count raises. | Worker exceptions propagate in input observation order. |
-| `smoke_check` | Normal malformed Rust runner parameters are encoded as failure. | Expected tool absence, nonzero exit, syntax errors, and timeouts are encoded in `SmokeResult`. |
+| `smoke_check` | Normal malformed Rust runner parameters are encoded as failure. | Expected tool absence, nonzero exit, syntax errors, and timeouts are encoded in `SmokeResult`; `infrastructure_failure` marks the ones that are not a verdict on the code. |
 
 Fail-closed does not mean “never raises.” Assay turns untrusted adjudication
 failures into typed non-approval where that primitive defines such an outcome;
