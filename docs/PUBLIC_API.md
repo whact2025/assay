@@ -318,6 +318,23 @@ tuple places `None`. The concrete backend decides how to interpret that field.
 for work completed outside `implement`. Both paths can raise `GitCaptureError`
 when Git cannot produce trustworthy evidence.
 
+Scope paths are literal. `implement` reads the directive's `files_in_scope`
+and `creates_paths`, and `capture_workspace_delta` reads `path_scope`, as
+paths relative to `cwd` and passes them to Git as exact names. No leading
+component is dropped, including one equal to the name of the `cwd` directory,
+and the working tree is not consulted to interpret a path, so a path names the
+same file before and after that file exists. A write to a path the scope does
+not name is outside it, also when the `cwd` directory is named `proj`: with a
+scope of `proj/src/a.py`, an invocation that newly dirties `src/a.py` returns
+that path in `scope_escapes` and is classified `hard_fail_scope_escape`,
+unless a capture failure, a backend error or a turn ceiling takes precedence.
+A `src/a.py` that was already dirty before the invocation is ambient: a
+further write to it is neither captured nor listed in `scope_escapes`, and
+the result is classified as if that write had not happened; an invocation
+that also changes a path the scope names can therefore still be a `success`.
+A caller whose paths are relative to another directory rewrites them before
+the call.
+
 ### `bench` and `sweep`
 
 `bench` runs `python -m <BenchConfig.runner>` once. It sends `bench_id`,

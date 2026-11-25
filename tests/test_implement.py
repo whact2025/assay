@@ -51,11 +51,11 @@ from assay.primitives.implement import (
     GitCaptureError,
     _IMPLEMENTER_SYSTEM_PROMPT,
     _build_implementer_prompt,
+    _capture_pathspecs,
     _classify,
     _git_diff_bytes,
     _git_head_sha,
     _git_modified_files,
-    _normalize_scope_for_cwd,
     _serialize_transcript,
     capture_workspace_delta,
     implement,
@@ -2603,6 +2603,24 @@ def test_capture_workspace_delta_public_helper(tmp_path: Path):
     assert b"other.txt" not in diff2
 
 
+def test_capture_workspace_delta_bounds_diff_and_files_by_one_shot_scope(
+    tmp_path: Path,
+):
+    """A scope handed over as a one-shot iterable bounds the diff and the
+    file list alike."""
+    _init_repo(tmp_path)
+    (tmp_path / "seed.txt").write_text("seed\nedited\n")
+    (tmp_path / "other.txt").write_text("outside the scope\n")
+
+    diff, files, _ = capture_workspace_delta(
+        cwd=str(tmp_path), path_scope=iter(("seed.txt",))
+    )
+
+    assert files == ("seed.txt",)
+    assert b"edited" in diff
+    assert b"other.txt" not in diff
+
+
 def test_execution_model_uses_required_protocol_attr(tmp_path: Path):
     """Execution provenance uses the Backend protocol's public model."""
     from assay.primitives.implement import _snapshot_execution
@@ -2620,50 +2638,302 @@ def test_execution_model_uses_required_protocol_attr(tmp_path: Path):
 
 
 # ----------------------------------------------------------------------
-# _normalize_scope_for_cwd — cwd-basename prefix handling
+# Scope paths are literal — a leading component is never dropped
 # ----------------------------------------------------------------------
-def test_normalize_scope_strips_redundant_single_level_prefix(tmp_path):
-    """fabric-usd/crates/foo.rs under cwd=<...>/fabric-usd is a redundant
-    workspace prefix: <cwd>/fabric-usd/crates does not exist (only
-    <cwd>/crates does), so the leading segment is stripped."""
-    cwd = tmp_path / "fabric-usd"
-    (cwd / "crates").mkdir(parents=True)
-    out = _normalize_scope_for_cwd(("fabric-usd/crates/foo.rs",), str(cwd))
-    assert out == ("crates/foo.rs",)
+@pytest.mark.parametrize(
+    "holds_same_named_directory",
+    [False, True],
+    ids=["no_same_named_directory", "same_named_directory"],
+)
+def test_capture_reads_scope_path_led_by_checkout_name_as_written(
+    tmp_path: Path,
+    holds_same_named_directory: bool,
+):
+    """A scope path names the same file before and after that file exists.
 
+    ``proj/src/a.py`` in a checkout directory named ``proj`` is
+    ``<checkout>/proj/src/a.py`` and never ``<checkout>/src/a.py``, whether
+    or not the checkout already holds a ``proj`` directory."""
+    repo = tmp_path / "proj"
+    (repo / "src").mkdir(parents=True)
+    _init_repo(repo)
+    if holds_same_named_directory:
+        (repo / "proj").mkdir()
+    (repo / "src" / "a.py").write_text("root twin\n")
+    (repo / "seed.txt").write_text("seed\nedited\n")
+    scope = ("proj/src/a.py", "seed.txt")
 
-def test_normalize_scope_keeps_real_nested_dir_prefix(tmp_path):
-    """The doubled kit/kit/ layout: cwd basename is 'kit' AND <cwd>/kit/
-    is a real child dir, so the leading 'kit/' in 'kit/source/...' is a
-    genuine path component and must be kept (stripping would point git at
-    a path that doesn't exist)."""
-    cwd = tmp_path / "kit"
-    (cwd / "kit" / "source").mkdir(parents=True)
-    out = _normalize_scope_for_cwd(
-        ("kit/source/UsdContext.cpp",), str(cwd)
+    diff_before, files_before, _ = capture_workspace_delta(
+        cwd=str(repo), path_scope=scope
     )
-    assert out == ("kit/source/UsdContext.cpp",)
+
+    (repo / "proj" / "src").mkdir(parents=True)
+    (repo / "proj" / "src" / "a.py").write_text("as written\n")
+    diff_after, files_after, _ = capture_workspace_delta(
+        cwd=str(repo), path_scope=scope
+    )
+
+    assert files_before == ("seed.txt",)
+    assert b"edited" in diff_before
+    assert b"root twin" not in diff_before
+    assert set(files_after) == {"proj/src/a.py", "seed.txt"}
+    assert b"as written" in diff_after
+    assert b"root twin" not in diff_after
 
 
-def test_normalize_scope_passthrough_non_colliding(tmp_path):
-    """A first segment that doesn't match basename(cwd) passes through."""
-    cwd = tmp_path / "kit"
-    (cwd / "rendering").mkdir(parents=True)
-    out = _normalize_scope_for_cwd(("rendering/x.cpp",), str(cwd))
-    assert out == ("rendering/x.cpp",)
+def test_capture_keeps_scope_path_when_its_directory_is_removed(
+    tmp_path: Path,
+):
+    """Deleting the last file of a directory is captured under the scope
+    path that named the file while it existed."""
+    repo = tmp_path / "proj"
+    (repo / "proj" / "src").mkdir(parents=True)
+    _init_repo(repo)
+    (repo / "proj" / "src" / "a.py").write_text("a = 1\n")
+    subprocess.run(["git", "add", "proj/src/a.py"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "add a"], cwd=repo, check=True
+    )
+    scope = ("proj/src/a.py",)
+
+    _, files_before, _ = capture_workspace_delta(
+        cwd=str(repo), path_scope=scope
+    )
+
+    (repo / "proj" / "src" / "a.py").unlink()
+    (repo / "proj" / "src").rmdir()
+    diff_after, files_after, _ = capture_workspace_delta(
+        cwd=str(repo), path_scope=scope
+    )
+
+    assert files_before == ()
+    assert files_after == ("proj/src/a.py",)
+    assert b"deleted file mode" in diff_after
+
+
+@pytest.mark.parametrize(
+    "holds_same_named_directory",
+    [False, True],
+    ids=["no_same_named_directory", "same_named_directory"],
+)
+def test_implement_reports_write_beside_scope_path_as_escape(
+    tmp_path: Path,
+    holds_same_named_directory: bool,
+):
+    """A write to ``src/a.py`` is outside a scope that names
+    ``proj/src/a.py``, also when the checkout directory is named ``proj``."""
+    repo = tmp_path / "proj"
+    (repo / "src").mkdir(parents=True)
+    _init_repo(repo)
+    if holds_same_named_directory:
+        (repo / "proj").mkdir()
+    corpus = Corpus(repo / "_corpus")
+
+    def write_root_twin():
+        (repo / "src" / "a.py").write_text("root twin\n")
+
+    backend = StubBackend(side_effect=write_root_twin)
+    impl = implement(
+        _make_spec(),
+        "S0",
+        _make_directive("S0", files_in_scope=("proj/src/a.py",)),
+        backend=backend,
+        corpus=corpus,
+        cwd=str(repo),
+    )
+
+    assert "- `proj/src/a.py`" in backend.invocations[0].user
+    assert impl.files_modified == ()
+    assert corpus.get_artifact(impl.diff_ref) == b""
+    assert impl.scope_escapes == ("src/a.py",)
+    assert impl.classification == "hard_fail_scope_escape"
+
+
+@pytest.mark.parametrize(
+    "holds_same_named_directory",
+    [False, True],
+    ids=["no_same_named_directory", "same_named_directory"],
+)
+def test_implement_captures_write_to_scope_path_led_by_checkout_name(
+    tmp_path: Path,
+    holds_same_named_directory: bool,
+):
+    """A write to ``proj/src/a.py`` is the invocation's file; a ``src/a.py``
+    that was dirty before the invocation is not."""
+    repo = tmp_path / "proj"
+    (repo / "src").mkdir(parents=True)
+    _init_repo(repo)
+    if holds_same_named_directory:
+        (repo / "proj").mkdir()
+    (repo / "src" / "a.py").write_text("root twin\n")
+    corpus = Corpus(repo / "_corpus")
+
+    def write_as_written():
+        (repo / "proj" / "src").mkdir(parents=True)
+        (repo / "proj" / "src" / "a.py").write_text("as written\n")
+
+    impl = implement(
+        _make_spec(),
+        "S0",
+        _make_directive("S0", files_in_scope=("proj/src/a.py",)),
+        backend=StubBackend(side_effect=write_as_written),
+        corpus=corpus,
+        cwd=str(repo),
+    )
+
+    diff = corpus.get_artifact(impl.diff_ref)
+    assert impl.files_modified == ("proj/src/a.py",)
+    assert b"as written" in diff
+    assert b"root twin" not in diff
+    assert impl.scope_escapes == ()
+    assert impl.classification == "success"
+
+
+def test_implement_captures_deletion_that_removes_the_scope_path_directory(
+    tmp_path: Path,
+):
+    """Deleting ``proj/src/a.py`` together with its directory is a change
+    inside the scope that names it, not an escape."""
+    repo = tmp_path / "proj"
+    (repo / "proj" / "src").mkdir(parents=True)
+    _init_repo(repo)
+    (repo / "proj" / "src" / "a.py").write_text("a = 1\n")
+    subprocess.run(["git", "add", "proj/src/a.py"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "add a"], cwd=repo, check=True
+    )
+    corpus = Corpus(repo / "_corpus")
+
+    def delete_with_directory():
+        (repo / "proj" / "src" / "a.py").unlink()
+        (repo / "proj" / "src").rmdir()
+
+    impl = implement(
+        _make_spec(),
+        "S0",
+        _make_directive("S0", files_in_scope=("proj/src/a.py",)),
+        backend=StubBackend(side_effect=delete_with_directory),
+        corpus=corpus,
+        cwd=str(repo),
+    )
+
+    assert impl.files_modified == ("proj/src/a.py",)
+    assert b"deleted file mode" in corpus.get_artifact(impl.diff_ref)
+    assert impl.scope_escapes == ()
+    assert impl.classification == "success"
+
+
+def test_implement_leaves_ambient_file_beside_scope_path_uncaptured(
+    tmp_path: Path,
+):
+    """A ``src/a.py`` that was dirty before the invocation is ambient to a
+    scope that names ``proj/src/a.py``: a further write to it is neither
+    captured nor reported as an escape, and with no other change the result
+    is an empty diff."""
+    repo = tmp_path / "proj"
+    (repo / "src").mkdir(parents=True)
+    _init_repo(repo)
+    (repo / "src" / "a.py").write_text("root twin\n")
+    corpus = Corpus(repo / "_corpus")
+
+    def write_root_twin_again():
+        (repo / "src" / "a.py").write_text("root twin\nwritten again\n")
+
+    impl = implement(
+        _make_spec(),
+        "S0",
+        _make_directive("S0", files_in_scope=("proj/src/a.py",)),
+        backend=StubBackend(side_effect=write_root_twin_again),
+        corpus=corpus,
+        cwd=str(repo),
+    )
+
+    assert impl.files_modified == ()
+    assert corpus.get_artifact(impl.diff_ref) == b""
+    assert impl.scope_escapes == ()
+    assert impl.classification == "hard_fail_empty_diff"
+
+
+def test_implement_classifies_scope_change_without_the_ambient_write(
+    tmp_path: Path,
+):
+    """An invocation that changes a path its scope names and also writes to
+    the ambient ``src/a.py`` is classified as if that write had not
+    happened: a success whose file list and diff do not hold it."""
+    repo = tmp_path / "proj"
+    (repo / "src").mkdir(parents=True)
+    _init_repo(repo)
+    (repo / "src" / "a.py").write_text("root twin\n")
+    corpus = Corpus(repo / "_corpus")
+
+    def write_both():
+        (repo / "src" / "a.py").write_text("root twin\nwritten again\n")
+        (repo / "seed.txt").write_text("seed\nedited\n")
+
+    impl = implement(
+        _make_spec(),
+        "S0",
+        _make_directive("S0", files_in_scope=("proj/src/a.py", "seed.txt")),
+        backend=StubBackend(side_effect=write_both),
+        corpus=corpus,
+        cwd=str(repo),
+    )
+
+    diff = corpus.get_artifact(impl.diff_ref)
+    assert impl.files_modified == ("seed.txt",)
+    assert b"edited" in diff
+    assert b"written again" not in diff
+    assert impl.scope_escapes == ()
+    assert impl.classification == "success"
+
+
+# ----------------------------------------------------------------------
+# _capture_pathspecs — what the scope keeps on its way to Git
+# ----------------------------------------------------------------------
+def test_capture_pathspecs_return_the_scope_as_given():
+    scope = ("src/a.py", "src/b.py")
+
+    assert _capture_pathspecs(None, ()) is None
+    assert _capture_pathspecs((), ()) == ()
+    assert _capture_pathspecs(scope, ()) == scope
+
+
+def test_capture_pathspecs_wrap_every_include_when_exclusions_are_given():
+    exclusion = ":(top,literal,exclude)_corpus"
+
+    assert _capture_pathspecs(
+        ("src/a.py", ":(exclude)b.py"), (exclusion,)
+    ) == (
+        ":(literal)src/a.py",
+        ":(literal):(exclude)b.py",
+        exclusion,
+    )
+    assert _capture_pathspecs(None, (exclusion,)) == (exclusion,)
+    assert _capture_pathspecs((), (exclusion,)) == (exclusion,)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="backslash is a Windows separator")
-def test_normalize_scope_preserves_literal_posix_backslash(tmp_path):
-    cwd = tmp_path / "repo"
-    cwd.mkdir()
-    out = _normalize_scope_for_cwd(("literal\\name.rs",), str(cwd))
-    assert out == ("literal\\name.rs",)
+def test_capture_pathspecs_keep_posix_backslash_as_a_name_byte():
+    assert _capture_pathspecs(("src/lit\\eral.py",), ()) == (
+        "src/lit\\eral.py",
+    )
 
 
-def test_normalize_scope_none_and_empty_passthrough(tmp_path):
-    assert _normalize_scope_for_cwd(None, str(tmp_path)) is None
-    assert _normalize_scope_for_cwd((), str(tmp_path)) == ()
+def test_capture_pathspecs_use_forward_slashes_on_windows(monkeypatch):
+    scope = ("src\\lib\\a.py", "src\\b.py", "src/c.py")
+    exclusion = ":(top,literal,exclude)_corpus"
+    with monkeypatch.context() as windows:
+        windows.setattr(os, "name", "nt")
+        plain = _capture_pathspecs(scope, ())
+        wrapped = _capture_pathspecs(scope, (exclusion,))
+
+    assert plain == ("src/lib/a.py", "src/b.py", "src/c.py")
+    assert wrapped == (
+        ":(literal)src/lib/a.py",
+        ":(literal)src/b.py",
+        ":(literal)src/c.py",
+        exclusion,
+    )
 
 
 def test_read_only_reference_is_context_and_never_allows_mutation(tmp_path):

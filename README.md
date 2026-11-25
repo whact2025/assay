@@ -449,10 +449,11 @@ reason, and execution context. It stores the diff and transcript as artifacts
 and returns the typed record; the workflow publishes that record.
 
 The directive's `files_in_scope + creates_paths` bounds capture and supports
-file-level `scope_escapes` detection. A `MutationRegion` is included in the
-implementer prompt, but line-range enforcement belongs to the consuming
-workflow. `classification` is an early transport/scope/delta signal, not a
-build or test result.
+file-level `scope_escapes` detection. Those paths are relative to `cwd` and are
+read as written; no leading directory name is dropped. A `MutationRegion` is
+included in the implementer prompt, but line-range enforcement belongs to the
+consuming workflow. `classification` is an early transport/scope/delta signal,
+not a build or test result.
 
 The primitive never commits, builds, tests, or rolls back. `result_commit` is
 therefore `None`. Concurrent workflows must pass an explicit per-workspace
