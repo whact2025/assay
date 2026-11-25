@@ -9,6 +9,12 @@ diff and agent transcript to the Corpus, and returns a typed Implementation.
 The persisted patch/file list is cumulative for the working tree; internal
 before/after captures separately determine whether this invocation changed it.
 
+Scope paths are literal. Each ``files_in_scope``/``creates_paths`` entry, like
+each ``path_scope`` entry of ``capture_workspace_delta``, names one path
+relative to ``cwd``. It is never rewritten against the working tree, so the
+captures before and after the invocation and the scope-escape check all read
+it as the same path.
+
 The primitive is deliberately minimal: it does NOT run build/verify
 (the recipe layer owns that), does NOT commit to git (the recipe
 decides whether to keep changes), and does NOT iterate beyond a single
@@ -640,54 +646,16 @@ def _git_capture(args: list[str], *, cwd: str | None = None) -> str:
         return ""
 
 
-def _normalize_scope_for_cwd(
-    path_scope: tuple[str, ...] | None,
-    cwd: str | None,
-) -> tuple[str, ...] | None:
-    """Normalize workspace-relative scopes for Git commands run in ``cwd``.
-
-    When a path's first segment equals ``basename(cwd)``, it may have been
-    authored relative to the parent workspace rather than the active project
-    root. The redundant segment is stripped unless the unstripped path (or an
-    existing parent) proves it is a real nested path. Other entries pass
-    through unchanged. Backslashes are normalized before segment matching.
-    """
-    if not path_scope:
-        return path_scope
-    import os
-    base_dir = os.path.abspath(cwd) if cwd else os.getcwd()
-    base = os.path.basename(base_dir)
-    if not base:
-        return path_scope
-    normalized: list[str] = []
-    for p in path_scope:
-        # Planner-authored paths may use OS-native separators. Normalize
-        # backslashes only on Windows; on POSIX a backslash is a valid literal
-        # filename byte and rewriting it would silently scope a different
-        # path. Git accepts forward slashes on Windows.
-        p_norm = p.replace("\\", "/") if os.name == "nt" else p
-        head, _, rest = p_norm.partition("/")
-        if head == base and rest:
-            # Keep the prefix when it names a real nested dir (the
-            # unstripped path or its parent exists under cwd); only strip
-            # when it's a redundant workspace prefix (resolves nowhere).
-            unstripped_abs = os.path.join(base_dir, p_norm)
-            if os.path.exists(unstripped_abs) or \
-                    os.path.isdir(os.path.dirname(unstripped_abs)):
-                normalized.append(p_norm)
-            else:
-                normalized.append(rest)
-        else:
-            normalized.append(p_norm)
-    return tuple(normalized)
-
-
 def _capture_pathspecs(
     path_scope: tuple[str, ...] | None,
-    cwd: str | None,
     exclude_pathspecs: tuple[str, ...],
 ) -> tuple[str, ...] | None:
     """Return exact include pathspecs plus trusted Git-native exclusions.
+
+    Every scope path reaches Git as written. No leading component is dropped
+    and the working tree is not consulted, so a path names the same file
+    before and after that file exists. The one rewrite is the Windows
+    separator.
 
     Ordinary callers retain ``GIT_LITERAL_PATHSPECS=1`` and their historical
     plain path strings.  ``implement`` supplies trusted exclusion magic for its
@@ -695,12 +663,17 @@ def _capture_pathspecs(
     ``:(literal)`` before Git pathspec magic is enabled.
     """
 
-    normalized = _normalize_scope_for_cwd(path_scope, cwd)
+    if path_scope and os.name == "nt":
+        # Planner-authored paths may use OS-native separators. Normalize
+        # backslashes only on Windows; on POSIX a backslash is a valid literal
+        # filename byte and rewriting it would silently scope a different
+        # path. Git accepts forward slashes on Windows.
+        path_scope = tuple(path.replace("\\", "/") for path in path_scope)
     if not exclude_pathspecs:
-        return normalized
+        return path_scope
     includes = tuple(
         f":(literal){path}"
-        for path in (normalized or ())
+        for path in (path_scope or ())
     )
     return (*includes, *exclude_pathspecs)
 
@@ -904,6 +877,14 @@ def capture_workspace_delta(
     This lets manual or externally driven completion paths record the same
     byte-level delta as ``implement`` without duplicating Git plumbing.
 
+    ``path_scope`` is read literally. Each entry is the path of one file or
+    directory relative to ``cwd`` and reaches Git as an exact name. No leading
+    component is dropped, including one equal to the name of the ``cwd``
+    directory, and the working tree is not consulted to interpret an entry, so
+    it names the same path before and after that path exists. A caller whose
+    paths are relative to another directory rewrites them before the call.
+    ``None`` or an empty tuple applies no scope.
+
     ``max_diff_bytes`` enables a streaming hard limit for callers handling
     untrusted worktrees. The producer is terminated as soon as it emits one
     byte beyond the limit; the oversized patch is never materialized.
@@ -917,6 +898,10 @@ def capture_workspace_delta(
         )
     ):
         raise ValueError("max_diff_bytes must be a positive integer or None")
+    if path_scope is not None:
+        # Several Git commands read the scope. A one-shot iterable would be
+        # spent by the first and leave the rest unscoped.
+        path_scope = tuple(path_scope)
     return (
         _git_diff_bytes(
             cwd=cwd,
@@ -943,7 +928,7 @@ def _git_diff_bytes(
     # untracked files as "to be added" without staging content, which
     # makes them visible to `git diff` as new-file diffs while keeping
     # the index otherwise clean.
-    path_scope = _capture_pathspecs(path_scope, cwd, exclude_pathspecs)
+    path_scope = _capture_pathspecs(path_scope, exclude_pathspecs)
     literal_pathspecs = "0" if exclude_pathspecs else "1"
 
     # Never borrow the checkout's live index for capture. An add-N/reset
@@ -1177,7 +1162,7 @@ def _git_modified_files(
     sibling slices in the same tier run concurrently without smearing
     each other's modifications into the captured Implementation record.
     """
-    path_scope = _capture_pathspecs(path_scope, cwd, exclude_pathspecs)
+    path_scope = _capture_pathspecs(path_scope, exclude_pathspecs)
     # ``--untracked-files=all`` (-uall) forces git to list every untracked
     # FILE individually. Without it, porcelain-v1 collapses an entirely-
     # untracked directory into a single ``dir/`` entry — so a greenfield

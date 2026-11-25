@@ -1433,6 +1433,12 @@ Untracked files are represented without mutating the live index. Capture
 failure produces `hard_fail_capture` plus a persisted diagnostic; the primitive
 does not return a successful empty patch.
 
+A scope path is relative to `cwd` and is used as written. Capture drops no
+leading component, including one equal to the name of the `cwd` directory, and
+never consults the working tree to interpret a path. The captures before and
+after the invocation and the scope-escape check therefore read each path as
+the same file, whether or not it exists yet.
+
 Newly dirty files outside `files_in_scope ∪ creates_paths` become
 `scope_escapes`. Files already dirty before invocation are treated as ambient,
 so modifying an already-dirty out-of-scope file can be a conservative false
@@ -1463,8 +1469,9 @@ primitive always sets `result_commit=None`; a workflow that lands the work
 stamps the resulting commit later. `log_dir` is currently unused.
 
 `capture_workspace_delta(cwd=None, path_scope=None, max_diff_bytes=None)` exposes
-the same Git capture without a backend call. A positive byte limit terminates
-capture immediately after the first excess byte and raises `GitCaptureError`.
+the same Git capture without a backend call and reads `path_scope` by the same
+literal rule. A positive byte limit terminates capture immediately after the
+first excess byte and raises `GitCaptureError`.
 
 ### 9.5 `bench`
 
